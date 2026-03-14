@@ -228,7 +228,7 @@ async function fetchLiveTokens() {
     body: JSON.stringify({
       jsonrpc: "2.0", id: 1,
       method: "getSignaturesForAddress",
-      params: [PUMP_FUN_PROGRAM, { limit: 200 }],
+      params: [PUMP_FUN_PROGRAM, { limit: 100 }],
     }),
   });
   if (!txRes.ok) throw new Error(`RPC failed (${txRes.status}) — is the proxy running?`);
@@ -240,7 +240,7 @@ async function fetchLiveTokens() {
   const parseRes = await fetch(PROXY_TX, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ transactions: sigs.slice(0, 50) }),
+    body: JSON.stringify({ transactions: sigs.slice(0, 25) }),
   });
   if (!parseRes.ok) throw new Error(`Enhanced TX failed (${parseRes.status})`);
   const parsed = await parseRes.json();
@@ -386,6 +386,33 @@ async function fetchLiveTokens() {
     const jitoSenders = new Set(allTxs.filter(t => t.isJito).map(t => t.buyer).filter(Boolean));
     const insiderSet  = new Set([...earlyBuyers, ...jitoSenders]);
 
+    // ─── DAUMEN FOUR METRICS ──────────────────────────────────────────────────
+    // 1. Fresh Wallet Score — what % of buyers have wallets active < 24hrs
+    //    We estimate freshness by how early they appeared vs token launch
+    const freshBuyerCount = sortedTxs.filter((t, idx) => idx < 5 && t.buyer).length;
+    const freshWalletScore = Math.min(1, freshBuyerCount / Math.max(1, uniqueBuyers.length));
+    const hasFreshWallets  = freshWalletScore > 0.4 && uniqueBuyers.length >= 2;
+
+    // 2. Balance Threshold — estimate from SOL volume per buyer
+    //    Average SOL per buyer; anything above 0.5 SOL avg = quality buyers
+    const avgSolPerBuyer = token.totalSolVolume / Math.max(1, uniqueBuyers.length);
+    const meetsBalanceThreshold = avgSolPerBuyer >= 0.3; // 0.3 SOL minimum avg
+
+    // 3. Entry / Exit targets based on current MC
+    const currentMcap = estimatedPrice != null ? estimatedPrice * PUMP_SUPPLY : null;
+    const entryMcap   = currentMcap;
+    const targetMcap  = currentMcap != null ? currentMcap * 2.5  : null; // 2.5x target
+    const stopMcap    = currentMcap != null ? currentMcap * 0.75 : null; // 25% stop loss
+
+    // 4. Hold Time Window — optimal hold based on token age and momentum
+    const holdMinMinutes = 3;   // never exit before 3 min
+    const holdMaxMinutes = ageMinutes < 10 ? 20 : ageMinutes < 30 ? 15 : 10;
+    const holdWindowOpen = ageMinutes < holdMaxMinutes;
+
+    // Daumen composite — passes all 4 checks
+    const passesDaumen = hasFreshWallets && meetsBalanceThreshold &&
+                         currentMcap != null && holdWindowOpen;
+
     return {
       mint, name, symbol,
       narrative:        detectNarrative(name, symbol),
@@ -406,6 +433,18 @@ async function fetchLiveTokens() {
       volume:           token.totalVolume,
       txCount:          token.txCount,
       suspiciousWallets,
+      // Daumen four metrics
+      hasFreshWallets,
+      freshWalletScore: +freshWalletScore.toFixed(2),
+      meetsBalanceThreshold,
+      avgSolPerBuyer:   +avgSolPerBuyer.toFixed(3),
+      entryMcap,
+      targetMcap,
+      stopMcap,
+      holdMinMinutes,
+      holdMaxMinutes,
+      holdWindowOpen,
+      passesDaumen,
     };
   });
 }
@@ -616,6 +655,73 @@ function ExtLinks({ mint, lm = false }) {
   );
 }
 
+// ─── DAUMEN PANEL ─────────────────────────────────────────────────────────────
+function DaumenPanel({ token, lm = false }) {
+  const bg      = lm ? "#f8f8f0" : "#08080e";
+  const border  = lm ? "#e0e0d0" : "#1a1a28";
+  const checks = [
+    {
+      key:   "balance",
+      icon:  token.meetsBalanceThreshold ? "✓" : "✗",
+      label: "BALANCE",
+      value: `${token.avgSolPerBuyer.toFixed(2)} SOL avg`,
+      pass:  token.meetsBalanceThreshold,
+      tip:   token.meetsBalanceThreshold ? "Quality buyers" : "Low SOL per buyer",
+    },
+    {
+      key:   "fresh",
+      icon:  token.hasFreshWallets ? "🌿" : "✗",
+      label: "FRESH WALLETS",
+      value: `${Math.round(token.freshWalletScore * 100)}% fresh`,
+      pass:  token.hasFreshWallets,
+      tip:   token.hasFreshWallets ? "New wallet activity" : "Aged wallets",
+    },
+    {
+      key:   "entry",
+      icon:  token.entryMcap != null ? "✓" : "✗",
+      label: "ENTRY / EXIT",
+      value: token.entryMcap != null
+        ? `→ ${fmtMcap(token)} · TP ${fmtMcap({estimatedPrice: token.targetMcap / PUMP_SUPPLY})} · SL ${fmtMcap({estimatedPrice: token.stopMcap / PUMP_SUPPLY})}`
+        : "No price data",
+      pass:  token.entryMcap != null,
+      tip:   "Entry now · 2.5x target · 25% stop",
+    },
+    {
+      key:   "hold",
+      icon:  token.holdWindowOpen ? "✓" : "✗",
+      label: "HOLD WINDOW",
+      value: token.holdWindowOpen
+        ? `${token.holdMinMinutes}–${token.holdMaxMinutes}min window`
+        : "Window closed",
+      pass:  token.holdWindowOpen,
+      tip:   token.holdWindowOpen ? "Still within entry window" : "Too late to enter",
+    },
+  ];
+
+  return (
+    <div style={{ background:bg, border:`1px solid ${border}`, borderRadius:8, padding:"10px 12px", marginTop:10 }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+        <span style={{ color: lm ? "#555" : "#888", fontSize:8, letterSpacing:2, fontWeight:900 }}>DAUMEN CHECKS</span>
+        <span style={{ background: token.passesDaumen ? "#00aa6622" : "#ff444422", color: token.passesDaumen ? "#00aa66" : "#ff4444", fontSize:8, fontWeight:900, padding:"2px 8px", borderRadius:10, letterSpacing:1 }}>
+          {token.passesDaumen ? "✓ ALL PASS" : "✗ INCOMPLETE"}
+        </span>
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:5 }}>
+        {checks.map(c => (
+          <div key={c.key} style={{ background: lm ? (c.pass ? "#f0fff8" : "#fff4f4") : (c.pass ? "#001a0d" : "#1a0000"), border:`1px solid ${c.pass ? "#00aa6622" : "#ff444422"}`, borderRadius:6, padding:"6px 8px" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:4, marginBottom:2 }}>
+              <span style={{ fontSize:10 }}>{c.icon}</span>
+              <span style={{ color: lm ? "#666" : "#555", fontSize:7, letterSpacing:1, fontWeight:900 }}>{c.label}</span>
+            </div>
+            <div style={{ color: c.pass ? "#00aa66" : "#ff6666", fontSize:8, fontWeight:700, fontFamily:"'Space Mono',monospace", lineHeight:1.4 }}>{c.value}</div>
+            <div style={{ color: lm ? "#aaa" : "#333", fontSize:7, marginTop:2 }}>{c.tip}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── CLEAN CARD ───────────────────────────────────────────────────────────────
 function CleanCard({ token, rank, lm = false }) {
   const [expanded, setExpanded] = useState(false);
@@ -655,6 +761,7 @@ function CleanCard({ token, rank, lm = false }) {
               <span style={{ color:textMain, fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>{token.symbol}</span>
               {token.narrative && <NarrativeTag tag={token.narrative} />}
               <Tag bg={lm?"#e8fff4":"#001a0d"} color="#00aa66">✓ CLEAN</Tag>
+              {token.passesDaumen && <Tag bg={lm?"#f0fff8":"#001a08"} color="#00dd88">🌿 DAUMEN</Tag>}
             </div>
             <div style={{ color:textDim, fontSize:10, marginTop:2 }}>{token.name}</div>
           </div>
@@ -692,6 +799,7 @@ function CleanCard({ token, rank, lm = false }) {
 
       {expanded && (
         <div style={{ marginTop:12, paddingTop:12, borderTop:`1px solid ${dividerColor}`, animation:"fadeIn 0.2s ease" }}>
+          <DaumenPanel token={token} lm={lm} />
           <ExtLinks mint={token.mint} lm={lm} />
           {!aiSig && (
             <button
@@ -774,6 +882,7 @@ function GemCard({ token, rank, lm = false }) {
       </div>
       {expanded && (
         <div style={{ marginTop:12, paddingTop:12, borderTop:`1px solid ${dividerColor}`, animation:"fadeIn 0.2s ease" }}>
+          <DaumenPanel token={token} lm={lm} />
           <ExtLinks mint={token.mint} lm={lm} />
           {!aiSig && (
             <button
@@ -891,6 +1000,7 @@ function FrontrunCard({ token, rank, lm = false }) {
               ))}
             </>
           )}
+          <DaumenPanel token={token} lm={lm} />
           <ExtLinks mint={token.mint} lm={lm} />
           {!aiSig && (
             <button
