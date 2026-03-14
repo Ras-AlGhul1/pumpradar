@@ -22,7 +22,7 @@ const JITO_TIP_ACCOUNTS = new Set([
   "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ]);
 
-// ─── PROFITABILITY HARD FILTERS (clean tab) ───────────────────────────────────
+// ─── PROFITABILITY HARD FILTERS (clean tab — fresh launches) ─────────────────
 const CLEAN_FILTERS = {
   MAX_BUNDLE_SCORE:    0.55,
   MAX_INSIDERS:        6,
@@ -30,13 +30,27 @@ const CLEAN_FILTERS = {
   MAX_AGE_MINUTES:     45,
   MIN_UNIQUE_BUYERS:   2,
   MIN_OPP_SCORE:       35,
+  MIN_MCAP_USD:        15_000,   // $15K minimum
+  MAX_MCAP_USD:        300_000,  // $300K maximum
+};
+
+// ─── GEMS TAB FILTERS (older coins, $50K–$1M MC, stricter safety) ─────────────
+const GEMS_FILTERS = {
+  MAX_BUNDLE_SCORE:    0.40,  // stricter
+  MAX_INSIDERS:        4,     // stricter
+  MAX_TOP_HOLDER_CONC: 0.55,
+  MAX_AGE_MINUTES:     1440,  // up to 24 hours
+  MIN_UNIQUE_BUYERS:   3,
+  MIN_OPP_SCORE:       35,
+  MIN_MCAP_USD:        50_000,    // $50K minimum
+  MAX_MCAP_USD:        1_000_000, // $1M maximum
 };
 
 // ─── FRONTRUN TAB FILTERS ─────────────────────────────────────────────────────
 // Catches coins where bundle is confirmed but price hasn't pumped yet
 const FRONTRUN_FILTERS = {
   MIN_BUNDLE_SCORE:  0.40,
-  MAX_AGE_MINUTES:   30,  // extended — coins may be seen late
+  MAX_AGE_MINUTES:   30,
   MAX_PRICE_CHANGE:  40,
   MIN_UNIQUE_BUYERS: 2,
 };
@@ -109,6 +123,11 @@ function opportunityScore(token) {
 }
 
 // ─── FILTER FUNCTIONS ─────────────────────────────────────────────────────────
+const PUMP_SUPPLY = 1_000_000_000;
+function getMcap(token) {
+  return token.jupPrice != null ? token.jupPrice * PUMP_SUPPLY : null;
+}
+
 function passesClean(token) {
   if (token.bundleScore      >  CLEAN_FILTERS.MAX_BUNDLE_SCORE)    return false;
   if (token.insiderCount     >  CLEAN_FILTERS.MAX_INSIDERS)        return false;
@@ -117,6 +136,24 @@ function passesClean(token) {
   if (token.uniqueBuyers     <  CLEAN_FILTERS.MIN_UNIQUE_BUYERS)   return false;
   if (token.jitoDetected)                                          return false;
   if (opportunityScore(token) < CLEAN_FILTERS.MIN_OPP_SCORE)       return false;
+  const mcap = getMcap(token);
+  if (mcap != null && mcap < CLEAN_FILTERS.MIN_MCAP_USD)           return false;
+  if (mcap != null && mcap > CLEAN_FILTERS.MAX_MCAP_USD)           return false;
+  return true;
+}
+
+function passesGems(token) {
+  if (token.bundleScore      >  GEMS_FILTERS.MAX_BUNDLE_SCORE)    return false;
+  if (token.insiderCount     >  GEMS_FILTERS.MAX_INSIDERS)        return false;
+  if (token.topHolderConc    >  GEMS_FILTERS.MAX_TOP_HOLDER_CONC) return false;
+  if (token.ageMinutes       >  GEMS_FILTERS.MAX_AGE_MINUTES)     return false;
+  if (token.uniqueBuyers     <  GEMS_FILTERS.MIN_UNIQUE_BUYERS)   return false;
+  if (token.jitoDetected)                                         return false;
+  if (opportunityScore(token) < GEMS_FILTERS.MIN_OPP_SCORE)       return false;
+  const mcap = getMcap(token);
+  if (mcap == null)                                               return false; // must have price data
+  if (mcap < GEMS_FILTERS.MIN_MCAP_USD)                          return false;
+  if (mcap > GEMS_FILTERS.MAX_MCAP_USD)                          return false;
   return true;
 }
 
@@ -194,10 +231,11 @@ async function fetchLiveTokens() {
   if (!parseRes.ok) throw new Error(`Enhanced TX failed (${parseRes.status})`);
   const parsed = await parseRes.json();
   if (!Array.isArray(parsed)) throw new Error("Unexpected response from transaction parser");
+  const validTxs = parsed.filter(tx => tx && tx.signature && !tx.error);
 
   // 3. Build tokenMap from parsed transactions
   const tokenMap = {};
-  for (const tx of parsed) {
+  for (const tx of validTxs) {
     const nativeTransfers = tx.nativeTransfers || [];
     const isJito = nativeTransfers.some(t => JITO_TIP_ACCOUNTS.has(t.toUserAccount));
     // Sum SOL moved in native transfers as proxy for bundle volume
@@ -275,9 +313,21 @@ async function fetchLiveTokens() {
     if (j.ok) prices = (await j.json()).data || {};
   } catch (_) {}
 
+  // Fix metadata index mismatch — build a map by mint address instead of relying on array index
+  const metaByMint = {};
+  for (let i = 0; i < mints.length; i++) {
+    const meta = metaArr[i];
+    if (meta && meta.account) {
+      metaByMint[meta.account] = meta;
+    } else if (meta) {
+      // fallback: assign by position if no account field
+      metaByMint[mints[i]] = meta;
+    }
+  }
+
   // 6. Build enriched token objects
-  return mints.map((mint, i) => {
-    const m            = metaArr[i] || {};
+  return mints.map((mint) => {
+    const m            = metaByMint[mint] || {};
     const name         = m.onChainMetadata?.metadata?.data?.name   || "Unknown";
     const symbol       = m.onChainMetadata?.metadata?.data?.symbol || "???";
     const token        = tokenMap[mint];
@@ -289,7 +339,7 @@ async function fetchLiveTokens() {
     // Record price for future scans and compute real % change
     recordPrice(mint, jupPrice);
     const realChange   = getRealPriceChange(mint, jupPrice);
-    const priceChange  = realChange ?? 0; // 0 if no history yet (first scan)
+    const priceChange  = realChange != null ? realChange : 0;
 
     // Sort timestamped txs for early buyer detection; exclude null-timestamp txs
     const sortedTxs = [...token.rawTxs]
@@ -340,28 +390,54 @@ async function fetchLiveTokens() {
   });
 }
 
+// ─── MARKETCAP HELPER ────────────────────────────────────────────────────────
+function fmtMcap(jupPrice) {
+  if (jupPrice == null) return null;
+  const mcap = jupPrice * PUMP_SUPPLY;
+  if (mcap >= 1_000_000) return `$${(mcap / 1_000_000).toFixed(1)}M`;
+  if (mcap >= 1_000)     return `$${(mcap / 1_000).toFixed(1)}K`;
+  return `$${mcap.toFixed(0)}`;
+}
+
 // ─── AI SIGNAL ────────────────────────────────────────────────────────────────
 async function getAISignal(token, mode) {
   const isClean = mode === "clean";
-  const prompt  = isClean
-    ? `You are a crypto trader specializing in pump.fun early-stage gems.
-Token: ${token.name} ($${token.symbol}) | Narrative: ${token.narrative || "none"}
-Age: ${token.ageMinutes}m | +${token.priceChange.toFixed(0)}% | Buyers: ${token.uniqueBuyers}
-Bundle: ${(token.bundleScore*100).toFixed(0)}% | Insiders: ${token.insiderCount} | TopH: ${(token.topHolderConc*100).toFixed(0)}% | Jito: NO
+  const mcap = token.jupPrice ? fmtMcap(token.jupPrice) : "unknown";
+  const prompt = isClean
+    ? `You are an aggressive pump.fun trader. Give a decisive signal — do NOT default to WATCH unless truly uncertain.
 
-Respond ONLY:
+Token: ${token.name} ($${token.symbol})
+Narrative: ${token.narrative || "none"} | Age: ${token.ageMinutes}m | Mcap: ${mcap}
+Price change: ${token.priceChange.toFixed(1)}% | Buyers: ${token.uniqueBuyers}
+Bundle score: ${(token.bundleScore*100).toFixed(0)}% | Insiders: ${token.insiderCount} | Jito: NO
+Opportunity score: ${opportunityScore(token)}/100 | Risk score: ${computeRisk(token)}/100
+
+Rules:
+- If opp > 60 and risk < 40 and buyers >= 5: STRONG BUY
+- If opp > 45 and risk < 55: BUY
+- If risk > 55 or insiders > 4: WATCH
+- Be specific about entry price/mcap and exit targets
+
+Respond ONLY in this exact format:
 SIGNAL: [STRONG BUY / BUY / WATCH]
-ENTRY: [one sentence]
-EXIT: [one sentence]`
-    : `You are a pump.fun frontrun specialist. Bundle activity confirmed.
-Token: ${token.name} ($${token.symbol}) | Age: ${token.ageMinutes}m | +${token.priceChange.toFixed(0)}%
-Jito: ${token.jitoDetected?"YES":"NO"} | Bundle: ${(token.bundleScore*100).toFixed(0)}% | Cluster: ${(token.slotClusterScore*100).toFixed(0)}%
-Window: ~${Math.round(frontrunWindowSecs(token)/60)}min remaining
+ENTRY: [one sentence with specific mcap entry point]
+EXIT: [one sentence with specific % target and stop loss]`
+    : `You are a pump.fun bundle frontrunner. Be decisive — money is on the line.
 
-Respond ONLY:
+Token: ${token.name} ($${token.symbol}) | Mcap: ${mcap}
+Age: ${token.ageMinutes}m | Price change so far: ${token.priceChange.toFixed(1)}%
+Jito: ${token.jitoDetected?"YES":"NO"} | Bundle: ${(token.bundleScore*100).toFixed(0)}% | Cluster: ${(token.slotClusterScore*100).toFixed(0)}%
+Window remaining: ~${Math.round(frontrunWindowSecs(token)/60)}min | Buyers: ${token.uniqueBuyers}
+
+Rules:
+- If bundle > 60% and price < 20% and window > 3min: FRONTRUN NOW
+- If bundle > 40% and window > 2min: RISKY FRONTRUN
+- If window < 2min or price already > 35%: AVOID
+
+Respond ONLY in this exact format:
 SIGNAL: [FRONTRUN NOW / RISKY FRONTRUN / AVOID]
-WINDOW: [one sentence on timing]
-STRATEGY: [one sentence specific action]`;
+WINDOW: [one sentence on how long you have and urgency]
+STRATEGY: [one sentence — exact action: buy X% position, target Y% gain, exit if Z]`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -372,7 +448,10 @@ STRATEGY: [one sentence specific action]`;
       messages: [{ role: "user", content: prompt }],
     }),
   });
-  if (!res.ok) throw new Error(`AI API ${res.status}`);
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`AI API ${res.status}: ${errText.slice(0, 100)}`);
+  }
   const data = await res.json();
   const text = data.content?.find(b => b.type === "text")?.text || "";
   const get  = key => text.match(new RegExp(`${key}:\\s*(.+)`, "i"))?.[1]?.trim() || "";
@@ -388,12 +467,12 @@ const fmtJup  = v => v != null ? `$${v < 0.000001 ? v.toExponential(2) : v.toPre
 const fmtSecs = s => { const n = Math.floor(s); return n <= 0 ? "CLOSED" : n < 60 ? `${n}s` : `~${Math.round(n/60)}m`; };
 
 // ─── SHARED UI ATOMS ─────────────────────────────────────────────────────────
-function Bar({ value, color, label }) {
+function Bar({ value, color, label, lm = false }) {
   return (
     <div>
-      {label && <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1, marginBottom:3 }}>{label}</div>}
+      {label && <div style={{ color: lm ? "#888" : "#2a2a3a", fontSize:8, letterSpacing:1, marginBottom:3 }}>{label}</div>}
       <div style={{ display:"flex", alignItems:"center", gap:7 }}>
-        <div style={{ flex:1, height:4, background:"#0c0c1a", borderRadius:2, overflow:"hidden" }}>
+        <div style={{ flex:1, height:4, background: lm ? "#e0e0d8" : "#0c0c1a", borderRadius:2, overflow:"hidden" }}>
           <div style={{ width:`${Math.min(value,100)}%`, height:"100%", background:`linear-gradient(90deg,${color}44,${color})`, borderRadius:2, transition:"width 0.8s ease" }} />
         </div>
         <span style={{ color, fontSize:9, fontWeight:700, minWidth:22, fontFamily:"'Space Mono',monospace" }}>{value}</span>
@@ -416,15 +495,31 @@ function NarrativeTag({ tag }) {
   return <Tag bg={bg} color={c}>{tag}</Tag>;
 }
 
-function AIPanel({ signal, mode }) {
+function AIPanel({ signal, mode, lm = false }) {
   if (!signal) return null;
   const isClean = mode === "clean";
   const key     = signal.signal?.toUpperCase() || "";
+
+  // Show error state
+  if (key === "ERROR") {
+    const msg = isClean ? signal.entry : signal.window;
+    return (
+      <div style={{ background: lm ? "#fff0f0" : "#1a0000", border:"1px solid #ff444433", borderRadius:8, padding:"10px 12px", marginTop:10 }}>
+        <div style={{ color:"#ff4444", fontSize:10, fontWeight:900, letterSpacing:1.5, marginBottom:6 }}>⚠ AI ERROR</div>
+        <div style={{ color: lm ? "#cc2200" : "#ff8888", fontSize:9, lineHeight:1.5 }}>{msg}</div>
+      </div>
+    );
+  }
+
   const cfg = isClean
-    ? { "STRONG BUY":["#001a0d","#00ff88","⚡"], "BUY":["#001510","#44ffaa","✓"], "WATCH":["#1a0d00","#ffaa00","👁"] }
-    : { "FRONTRUN NOW":["#001a0d","#00ff88","🎯"], "RISKY FRONTRUN":["#1a0d00","#ffaa00","⚠"], "AVOID":["#1a0000","#ff4444","✕"] };
-  const match      = Object.keys(cfg).find(k => key.includes(k)) || (isClean ? "WATCH" : "AVOID");
-  const [bg, color, icon] = cfg[match];
+    ? { "STRONG BUY":["#001a0d","#00aa66","⚡"], "BUY":["#001510","#44bb88","✓"], "WATCH":["#1a0d00","#ffaa00","👁"] }
+    : { "FRONTRUN NOW":["#001a0d","#00aa66","🎯"], "RISKY FRONTRUN":["#1a0d00","#ffaa00","⚠"], "AVOID":["#1a0000","#ff4444","✕"] };
+  const lmCfg = isClean
+    ? { "STRONG BUY":["#e8fff4","#00aa66","⚡"], "BUY":["#e8fff4","#009955","✓"], "WATCH":["#fff8e8","#cc8800","👁"] }
+    : { "FRONTRUN NOW":["#e8fff4","#00aa66","🎯"], "RISKY FRONTRUN":["#fff8e8","#cc8800","⚠"], "AVOID":["#fff0f0","#ff4444","✕"] };
+  const cfgMap  = lm ? lmCfg : cfg;
+  const match   = Object.keys(cfgMap).find(k => key.includes(k)) || (isClean ? "WATCH" : "AVOID");
+  const [bg, color, icon] = cfgMap[match];
   const lines = isClean
     ? [{ k:"ENTRY", v:signal.entry }, { k:"EXIT", v:signal.exit }]
     : [{ k:"WINDOW", v:signal.window }, { k:"STRATEGY", v:signal.strategy }];
@@ -433,8 +528,8 @@ function AIPanel({ signal, mode }) {
       <div style={{ color, fontSize:10, fontWeight:900, letterSpacing:1.5, marginBottom:6 }}>{icon} AI: {match}</div>
       {lines.map(l => l.v ? (
         <div key={l.k} style={{ marginBottom:4 }}>
-          <span style={{ color:"#333", fontSize:8, letterSpacing:1 }}>{l.k}: </span>
-          <span style={{ color:"#aaa", fontSize:10, lineHeight:1.5 }}>{l.v}</span>
+          <span style={{ color: lm ? "#888" : "#333", fontSize:8, letterSpacing:1 }}>{l.k}: </span>
+          <span style={{ color: lm ? "#333" : "#aaa", fontSize:10, lineHeight:1.5 }}>{l.v}</span>
         </div>
       ) : null)}
     </div>
@@ -455,7 +550,7 @@ function CountdownTimer({ initialSeconds }) {
   return <span style={{ color, fontWeight:900, fontFamily:"'Space Mono',monospace", fontSize:13 }}>{fmtSecs(rem)}</span>;
 }
 
-function CopyCA({ mint }) {
+function CopyCA({ mint, lm = false }) {
   const [copied, setCopied] = useState(false);
   const copy = (e) => {
     e.stopPropagation();
@@ -467,31 +562,31 @@ function CopyCA({ mint }) {
   return (
     <div
       onClick={copy}
-      style={{ display:"flex", alignItems:"center", justifyContent:"space-between", background:"#08080f", border:`1px solid ${copied ? "#00ff8844" : "#1a1a2a"}`, borderRadius:6, padding:"7px 10px", marginBottom:8, cursor:"pointer", transition:"border 0.2s" }}
+      style={{ display:"flex", alignItems:"center", justifyContent:"space-between", background: lm ? "#f5f5f0" : "#08080f", border:`1px solid ${copied ? "#00aa6644" : (lm ? "#e0e0d8" : "#1a1a2a")}`, borderRadius:6, padding:"7px 10px", marginBottom:8, cursor:"pointer", transition:"border 0.2s" }}
     >
-      <span style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1, fontFamily:"'Space Mono',monospace", flexShrink:0, marginRight:8 }}>CA</span>
-      <span style={{ color:"#444", fontSize:8, fontFamily:"'Space Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1 }}>{mint}</span>
-      <span style={{ color: copied ? "#00ff88" : "#333", fontSize:8, fontWeight:900, letterSpacing:1, flexShrink:0, marginLeft:8, fontFamily:"'Space Mono',monospace" }}>
+      <span style={{ color: lm ? "#888" : "#2a2a3a", fontSize:8, letterSpacing:1, fontFamily:"'Space Mono',monospace", flexShrink:0, marginRight:8 }}>CA</span>
+      <span style={{ color: lm ? "#aaa" : "#444", fontSize:8, fontFamily:"'Space Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1 }}>{mint}</span>
+      <span style={{ color: copied ? "#00aa66" : (lm ? "#aaa" : "#333"), fontSize:8, fontWeight:900, letterSpacing:1, flexShrink:0, marginLeft:8, fontFamily:"'Space Mono',monospace" }}>
         {copied ? "✓ COPIED" : "COPY"}
       </span>
     </div>
   );
 }
 
-function ExtLinks({ mint }) {
+function ExtLinks({ mint, lm = false }) {
   const links = [
-    { href:`https://pump.fun/coin/${mint}`,          label:"PUMP.FUN", bg:"#0d1f0d", color:"#00ff88" },
-    { href:`https://dexscreener.com/solana/${mint}`, label:"DEXSCR",  bg:"#1a0d1a", color:"#cc88ff" },
-    { href:`https://solscan.io/token/${mint}`,        label:"SOLSCAN", bg:"#0d0d2a", color:"#5bc0ff" },
+    { href:`https://pump.fun/coin/${mint}`,          label:"PUMP.FUN", bg: lm ? "#e8fff4" : "#0d1f0d", color:"#00aa66" },
+    { href:`https://dexscreener.com/solana/${mint}`, label:"DEXSCR",   bg: lm ? "#f4e8ff" : "#1a0d1a", color:"#cc88ff" },
+    { href:`https://solscan.io/token/${mint}`,        label:"SOLSCAN",  bg: lm ? "#e8f4ff" : "#0d0d2a", color:"#5bc0ff" },
   ];
   return (
     <div style={{ marginBottom:10 }}>
-      <CopyCA mint={mint} />
+      <CopyCA mint={mint} lm={lm} />
       <div style={{ display:"flex", gap:8 }}>
         {links.map(l => (
           <a key={l.label} href={l.href} target="_blank" rel="noopener noreferrer"
             onClick={e => e.stopPropagation()}
-            style={{ flex:1, textAlign:"center", background:l.bg, color:l.color, border:`1px solid ${l.color}22`, borderRadius:6, padding:"7px 0", fontSize:8, fontWeight:900, textDecoration:"none", letterSpacing:0.5, fontFamily:"'Space Mono',monospace" }}>
+            style={{ flex:1, textAlign:"center", background:l.bg, color:l.color, border:`1px solid ${l.color}33`, borderRadius:6, padding:"7px 0", fontSize:8, fontWeight:900, textDecoration:"none", letterSpacing:0.5, fontFamily:"'Space Mono',monospace" }}>
             {l.label} ↗
           </a>
         ))}
@@ -501,7 +596,7 @@ function ExtLinks({ mint }) {
 }
 
 // ─── CLEAN CARD ───────────────────────────────────────────────────────────────
-function CleanCard({ token, rank }) {
+function CleanCard({ token, rank, lm = false }) {
   const [expanded, setExpanded] = useState(false);
   const [aiSig, setAiSig]       = useState(null);
   const [aiLoad, setAiLoad]     = useState(false);
@@ -510,68 +605,82 @@ function CleanCard({ token, rank }) {
   const opp  = useMemo(() => opportunityScore(token), // eslint-disable-line react-hooks/exhaustive-deps
     [token.mint, token.priceChange, token.uniqueBuyers, token.ageMinutes, risk]);
   const ac   = OC(opp);
+  const cardBg   = lm ? "#ffffff" : "linear-gradient(135deg,#070712,#0b0b1e)";
+  const cardBorder = lm ? "#e0e0d8" : "#00ff8812";
+  const statBg   = lm ? "#f5f5f0" : "#050510";
+  const statBorder = lm ? "#e0e0d8" : "#0f0f20";
+  const textMain = lm ? "#111" : "#fff";
+  const textDim  = lm ? "#666" : "#333";
+  const textMuted = lm ? "#999" : "#2a2a3a";
+  const dividerColor = lm ? "#e8e8e0" : "#0f0f20";
+  const aiBtnBg  = lm ? "linear-gradient(135deg,#e8f0ff,#e8fff4)" : "linear-gradient(135deg,#0d1f3a,#0d2a1a)";
+  const aiBtnBorder = lm ? "#5bc0ff44" : "#5bc0ff18";
+  const aiBtnColor = lm ? "#0077aa" : "#5bc0ff";
 
   return (
     <div
       onClick={() => setExpanded(e => !e)}
-      style={{ background:"linear-gradient(135deg,#070712,#0b0b1e)", border:"1px solid #00ff8812", borderLeft:`3px solid ${ac}`, borderRadius:10, padding:"14px 16px", cursor:"pointer", position:"relative", overflow:"hidden", transition:"box-shadow 0.2s" }}
-      onMouseEnter={e => e.currentTarget.style.boxShadow = "0 0 24px #00ff8810"}
+      style={{ background:cardBg, border:`1px solid ${cardBorder}`, borderLeft:`3px solid ${ac}`, borderRadius:10, padding:"14px 16px", cursor:"pointer", position:"relative", overflow:"hidden", transition:"box-shadow 0.2s" }}
+      onMouseEnter={e => e.currentTarget.style.boxShadow = lm ? "0 2px 16px #00000018" : "0 0 24px #00ff8810"}
       onMouseLeave={e => e.currentTarget.style.boxShadow = "none"}
     >
       <div style={{ position:"absolute", top:0, left:0, right:0, height:1, background:`linear-gradient(90deg,transparent,${ac}22,transparent)`, pointerEvents:"none" }} />
 
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8 }}>
         <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={{ width:32, height:32, borderRadius:"50%", background:`conic-gradient(${ac} 0deg,#0d0d1e 360deg)`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:900, color:ac, flexShrink:0 }}>#{rank}</div>
+          <div style={{ width:32, height:32, borderRadius:"50%", background:`conic-gradient(${ac} 0deg,${lm?"#e8e8e0":"#0d0d1e"} 360deg)`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:900, color:ac, flexShrink:0 }}>#{rank}</div>
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:5, flexWrap:"wrap" }}>
-              <span style={{ color:"#fff", fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>{token.symbol}</span>
+              <span style={{ color:textMain, fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>{token.symbol}</span>
               {token.narrative && <NarrativeTag tag={token.narrative} />}
-              <Tag bg="#001a0d" color="#00ff88">✓ CLEAN</Tag>
+              <Tag bg={lm?"#e8fff4":"#001a0d"} color="#00aa66">✓ CLEAN</Tag>
             </div>
-            <div style={{ color:"#333", fontSize:10, marginTop:2 }}>{token.name}</div>
+            <div style={{ color:textDim, fontSize:10, marginTop:2 }}>{token.name}</div>
           </div>
         </div>
         <div style={{ textAlign:"right", flexShrink:0 }}>
-          <div style={{ color:"#00ff88", fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>+{token.priceChange.toFixed(1)}%</div>
-          <div style={{ color:"#2a2a3a", fontSize:9, marginTop:1 }}>{token.ageMinutes}m old</div>
+          <div style={{ color:"#00aa66", fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>+{token.priceChange.toFixed(1)}%</div>
+          <div style={{ color:textMuted, fontSize:9, marginTop:1 }}>{token.ageMinutes}m old</div>
           {token.jupPrice != null && (
             <div style={{ color:"#5bc0ff", fontSize:9, marginTop:1 }}>{fmtJup(token.jupPrice)}</div>
+          )}
+          {fmtMcap(token.jupPrice) && (
+            <div style={{ color:"#ffaa00", fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token.jupPrice)}</div>
           )}
         </div>
       </div>
 
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:5, marginTop:10 }}>
         {[
-          { l:"INSIDERS", v:token.insiderCount,                         c:token.insiderCount > 2 ? "#ffaa00" : "#00ff88" },
-          { l:"BUNDLE",   v:`${(token.bundleScore*100).toFixed(0)}%`,   c:"#00ff88" },
-          { l:"TOP10",    v:`${(token.topHolderConc*100).toFixed(0)}%`, c:token.topHolderConc > 0.35 ? "#ffaa00" : "#00ff88" },
+          { l:"INSIDERS", v:token.insiderCount,                         c:token.insiderCount > 2 ? "#ffaa00" : "#00aa66" },
+          { l:"BUNDLE",   v:`${(token.bundleScore*100).toFixed(0)}%`,   c:"#00aa66" },
+          { l:"TOP10",    v:`${(token.topHolderConc*100).toFixed(0)}%`, c:token.topHolderConc > 0.35 ? "#ffaa00" : "#00aa66" },
           { l:"BUYERS",   v:token.uniqueBuyers,                         c:"#5bc0ff" },
         ].map(s => (
-          <div key={s.l} style={{ background:"#050510", borderRadius:6, padding:"6px 8px", border:"1px solid #0f0f20" }}>
-            <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1 }}>{s.l}</div>
+          <div key={s.l} style={{ background:statBg, borderRadius:6, padding:"6px 8px", border:`1px solid ${statBorder}` }}>
+            <div style={{ color:textMuted, fontSize:8, letterSpacing:1 }}>{s.l}</div>
             <div style={{ color:s.c, fontWeight:700, fontSize:12, fontFamily:"'Space Mono',monospace" }}>{s.v}</div>
           </div>
         ))}
       </div>
 
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:10 }}>
-        <Bar value={risk} color={RC(risk)} label="RISK" />
-        <Bar value={opp}  color={OC(opp)}  label="OPPORTUNITY" />
+        <Bar value={risk} color={RC(risk)} label="RISK" lm={lm} />
+        <Bar value={opp}  color={OC(opp)}  label="OPPORTUNITY" lm={lm} />
       </div>
 
       {expanded && (
-        <div style={{ marginTop:12, paddingTop:12, borderTop:"1px solid #0f0f20", animation:"fadeIn 0.2s ease" }}>
-          <ExtLinks mint={token.mint} />
+        <div style={{ marginTop:12, paddingTop:12, borderTop:`1px solid ${dividerColor}`, animation:"fadeIn 0.2s ease" }}>
+          <ExtLinks mint={token.mint} lm={lm} />
           {!aiSig && (
             <button
-              onClick={async e => { e.stopPropagation(); setAiLoad(true); try { setAiSig(await getAISignal(token,"clean")); } catch { setAiSig({ signal:"WATCH", entry:"Analysis unavailable.", exit:"" }); } setAiLoad(false); }}
+              onClick={async e => { e.stopPropagation(); setAiLoad(true); try { setAiSig(await getAISignal(token,"clean")); } catch(err) { setAiSig({ signal:"ERROR", entry: err.message || "API call failed — check console.", exit:"" }); } setAiLoad(false); }}
               disabled={aiLoad}
-              style={{ width:"100%", padding:"9px 0", background:aiLoad?"#0f0f20":"linear-gradient(135deg,#0d1f3a,#0d2a1a)", border:"1px solid #5bc0ff18", borderRadius:8, color:aiLoad?"#2a2a3a":"#5bc0ff", fontSize:9, fontWeight:900, letterSpacing:1.5, cursor:aiLoad?"default":"pointer", fontFamily:"'Space Mono',monospace" }}>
+              style={{ width:"100%", padding:"9px 0", background:aiLoad?(lm?"#e8e8e0":"#0f0f20"):aiBtnBg, border:`1px solid ${aiBtnBorder}`, borderRadius:8, color:aiLoad?(lm?"#aaa":"#2a2a3a"):aiBtnColor, fontSize:9, fontWeight:900, letterSpacing:1.5, cursor:aiLoad?"default":"pointer", fontFamily:"'Space Mono',monospace" }}>
               {aiLoad ? "⏳ ANALYZING..." : "🤖 AI ENTRY SIGNAL"}
             </button>
           )}
-          {aiSig && <AIPanel signal={aiSig} mode="clean" />}
+          {aiSig && <AIPanel signal={aiSig} mode="clean" lm={lm} />}
         </div>
       )}
     </div>
@@ -579,7 +688,7 @@ function CleanCard({ token, rank }) {
 }
 
 // ─── FRONTRUN CARD ────────────────────────────────────────────────────────────
-function FrontrunCard({ token, rank }) {
+function FrontrunCard({ token, rank, lm = false }) {
   const [expanded, setExpanded] = useState(false);
   const [aiSig, setAiSig]       = useState(null);
   const [aiLoad, setAiLoad]     = useState(false);
@@ -588,50 +697,63 @@ function FrontrunCard({ token, rank }) {
   const winSecs = useMemo(() => Math.floor(frontrunWindowSecs(token)), // eslint-disable-line react-hooks/exhaustive-deps
     [token.mint, token.ageMinutes, token.jitoDetected, token.firstSeen]);
   const uc = winSecs <= 60 ? "#ff3b3b" : winSecs <= 180 ? "#ffaa00" : "#5bc0ff";
+  const cardBg    = lm ? "#ffffff" : "linear-gradient(135deg,#0e0707,#160b0b)";
+  const statBg    = lm ? "#f5f5f0" : "#050510";
+  const statBorder = lm ? "#e0e0d8" : "#0f0f20";
+  const windowBg  = lm ? "#fff8f8" : "#08030a";
+  const textMain  = lm ? "#111" : "#fff";
+  const textDim   = lm ? "#666" : "#333";
+  const textMuted = lm ? "#999" : "#2a2a3a";
+  const divider   = lm ? "#e8e0e0" : "#150808";
+  const walletBg  = lm ? "#fff0f0" : "#060610";
+  const uc = winSecs <= 60 ? "#ff3b3b" : winSecs <= 180 ? "#ffaa00" : "#5bc0ff";
 
   return (
     <div
       onClick={() => setExpanded(e => !e)}
-      style={{ background:"linear-gradient(135deg,#0e0707,#160b0b)", border:`1px solid ${uc}18`, borderLeft:`3px solid ${uc}`, borderRadius:10, padding:"14px 16px", cursor:"pointer", position:"relative", overflow:"hidden", transition:"box-shadow 0.2s" }}
-      onMouseEnter={e => e.currentTarget.style.boxShadow = `0 0 24px ${uc}14`}
+      style={{ background:cardBg, border:`1px solid ${uc}18`, borderLeft:`3px solid ${uc}`, borderRadius:10, padding:"14px 16px", cursor:"pointer", position:"relative", overflow:"hidden", transition:"box-shadow 0.2s" }}
+      onMouseEnter={e => e.currentTarget.style.boxShadow = lm ? "0 2px 16px #00000018" : `0 0 24px ${uc}14`}
       onMouseLeave={e => e.currentTarget.style.boxShadow = "none"}
     >
       <div style={{ position:"absolute", top:0, left:0, right:0, height:1, background:`linear-gradient(90deg,transparent,${uc}28,transparent)`, pointerEvents:"none" }} />
 
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8 }}>
         <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={{ width:32, height:32, borderRadius:"50%", background:`conic-gradient(${uc} 0deg,#0d0d1e 360deg)`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:900, color:uc, flexShrink:0 }}>#{rank}</div>
+          <div style={{ width:32, height:32, borderRadius:"50%", background:`conic-gradient(${uc} 0deg,${lm?"#e8e8e0":"#0d0d1e"} 360deg)`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:900, color:uc, flexShrink:0 }}>#{rank}</div>
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:5, flexWrap:"wrap" }}>
-              <span style={{ color:"#fff", fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>{token.symbol}</span>
+              <span style={{ color:textMain, fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>{token.symbol}</span>
               {token.narrative && <NarrativeTag tag={token.narrative} />}
-              {token.jitoDetected && <Tag bg="#1a0000" color="#ff4444">⚡ JITO</Tag>}
-              {token.isBundled    && <Tag bg="#2a1400" color="#ffaa00">BUNDLE</Tag>}
+              {token.jitoDetected && <Tag bg={lm?"#fff0f0":"#1a0000"} color="#ff4444">⚡ JITO</Tag>}
+              {token.isBundled    && <Tag bg={lm?"#fff8e8":"#2a1400"} color="#ffaa00">BUNDLE</Tag>}
             </div>
-            <div style={{ color:"#333", fontSize:10, marginTop:2 }}>{token.name}</div>
+            <div style={{ color:textDim, fontSize:10, marginTop:2 }}>{token.name}</div>
           </div>
         </div>
         <div style={{ textAlign:"right", flexShrink:0 }}>
           <div style={{ color:"#ffaa00", fontWeight:900, fontSize:13, fontFamily:"'Space Mono',monospace" }}>+{token.priceChange.toFixed(1)}%</div>
-          <div style={{ color:"#2a2a3a", fontSize:9, marginTop:1 }}>{token.ageMinutes}m old</div>
+          <div style={{ color:textMuted, fontSize:9, marginTop:1 }}>{token.ageMinutes}m old</div>
+          {fmtMcap(token.jupPrice) && (
+            <div style={{ color:"#ffaa00", fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token.jupPrice)}</div>
+          )}
         </div>
       </div>
 
-      <div style={{ marginTop:10, background:"#08030a", border:`1px solid ${uc}28`, borderRadius:8, padding:"9px 12px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+      <div style={{ marginTop:10, background:windowBg, border:`1px solid ${uc}28`, borderRadius:8, padding:"9px 12px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div>
-          <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1, marginBottom:2 }}>WINDOW LEFT</div>
+          <div style={{ color:textMuted, fontSize:8, letterSpacing:1, marginBottom:2 }}>WINDOW LEFT</div>
           <CountdownTimer initialSeconds={winSecs} />
         </div>
         <div style={{ textAlign:"right" }}>
-          <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1 }}>BUNDLE</div>
+          <div style={{ color:textMuted, fontSize:8, letterSpacing:1 }}>BUNDLE</div>
           <div style={{ color:"#ff6666", fontWeight:900, fontSize:13, fontFamily:"'Space Mono',monospace" }}>{(token.bundleScore*100).toFixed(0)}%</div>
         </div>
         <div style={{ textAlign:"right" }}>
-          <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1 }}>SLOT CLUSTER</div>
+          <div style={{ color:textMuted, fontSize:8, letterSpacing:1 }}>SLOT CLUSTER</div>
           <div style={{ color:"#ffaa00", fontWeight:900, fontSize:13, fontFamily:"'Space Mono',monospace" }}>{(token.slotClusterScore*100).toFixed(0)}%</div>
         </div>
         <div style={{ textAlign:"right" }}>
-          <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1 }}>JITO TXS</div>
+          <div style={{ color:textMuted, fontSize:8, letterSpacing:1 }}>JITO TXS</div>
           <div style={{ color:"#ff4444", fontWeight:900, fontSize:13, fontFamily:"'Space Mono',monospace" }}>{token.jitoTxCount}</div>
         </div>
       </div>
@@ -642,41 +764,41 @@ function FrontrunCard({ token, rank }) {
           { l:"TOP10",    v:`${(token.topHolderConc*100).toFixed(0)}%`, c:"#ffaa00" },
           { l:"BUYERS",   v:token.uniqueBuyers,                         c:"#5bc0ff" },
         ].map(s => (
-          <div key={s.l} style={{ background:"#050510", borderRadius:6, padding:"6px 8px", border:"1px solid #0f0f20" }}>
-            <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1 }}>{s.l}</div>
+          <div key={s.l} style={{ background:statBg, borderRadius:6, padding:"6px 8px", border:`1px solid ${statBorder}` }}>
+            <div style={{ color:textMuted, fontSize:8, letterSpacing:1 }}>{s.l}</div>
             <div style={{ color:s.c, fontWeight:700, fontSize:12, fontFamily:"'Space Mono',monospace" }}>{s.v}</div>
           </div>
         ))}
       </div>
 
       <div style={{ marginTop:8 }}>
-        <Bar value={risk} color={RC(risk)} label="RISK (higher = dumps sooner)" />
+        <Bar value={risk} color={RC(risk)} label="RISK (higher = dumps sooner)" lm={lm} />
       </div>
 
       {expanded && (
-        <div style={{ marginTop:12, paddingTop:12, borderTop:"1px solid #150808", animation:"fadeIn 0.2s ease" }}>
+        <div style={{ marginTop:12, paddingTop:12, borderTop:`1px solid ${divider}`, animation:"fadeIn 0.2s ease" }}>
           {(token.suspiciousWallets?.length ?? 0) > 0 && (
             <>
-              <div style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1, marginBottom:6 }}>FLAGGED WALLETS</div>
+              <div style={{ color:textMuted, fontSize:8, letterSpacing:1, marginBottom:6 }}>FLAGGED WALLETS</div>
               {token.suspiciousWallets.slice(0, 5).map((w, wi) => (
-                <div key={wi} style={{ display:"flex", justifyContent:"space-between", background:"#060610", borderRadius:6, padding:"6px 10px", marginBottom:4, fontFamily:"'Space Mono',monospace" }}>
+                <div key={wi} style={{ display:"flex", justifyContent:"space-between", background:walletBg, borderRadius:6, padding:"6px 10px", marginBottom:4, fontFamily:"'Space Mono',monospace" }}>
                   <span style={{ color:w.action === "jito bundle" ? "#ff4444" : w.action === "dev/deployer" ? "#ffaa00" : "#ff8866", fontSize:9 }}>{(w.address||"").slice(0,4)}...{(w.address||"").slice(-4)}</span>
-                  <span style={{ color:"#444", fontSize:9 }}>{w.action} · {w.percent}%</span>
-                  {w.slot && <span style={{ color:"#222", fontSize:8 }}>slot {w.slot}</span>}
+                  <span style={{ color: lm ? "#888" : "#444", fontSize:9 }}>{w.action} · {w.percent}%</span>
+                  {w.slot && <span style={{ color: lm ? "#bbb" : "#222", fontSize:8 }}>slot {w.slot}</span>}
                 </div>
               ))}
             </>
           )}
-          <ExtLinks mint={token.mint} />
+          <ExtLinks mint={token.mint} lm={lm} />
           {!aiSig && (
             <button
-              onClick={async e => { e.stopPropagation(); setAiLoad(true); try { setAiSig(await getAISignal(token,"frontrun")); } catch { setAiSig({ signal:"AVOID", window:"Analysis unavailable.", strategy:"" }); } setAiLoad(false); }}
+              onClick={async e => { e.stopPropagation(); setAiLoad(true); try { setAiSig(await getAISignal(token,"frontrun")); } catch(err) { setAiSig({ signal:"ERROR", window: err.message || "API call failed — check console.", strategy:"" }); } setAiLoad(false); }}
               disabled={aiLoad}
-              style={{ width:"100%", padding:"9px 0", background:aiLoad?"#0f0f20":"linear-gradient(135deg,#1a0505,#1a0a00)", border:"1px solid #ff444418", borderRadius:8, color:aiLoad?"#2a2a3a":"#ff8866", fontSize:9, fontWeight:900, letterSpacing:1.5, cursor:aiLoad?"default":"pointer", fontFamily:"'Space Mono',monospace" }}>
+              style={{ width:"100%", padding:"9px 0", background:aiLoad?(lm?"#e8e8e0":"#0f0f20"):(lm?"linear-gradient(135deg,#fff0f0,#fff8e8)":"linear-gradient(135deg,#1a0505,#1a0a00)"), border:`1px solid ${lm?"#ffaa0044":"#ff444418"}`, borderRadius:8, color:aiLoad?(lm?"#aaa":"#2a2a3a"):(lm?"#cc6600":"#ff8866"), fontSize:9, fontWeight:900, letterSpacing:1.5, cursor:aiLoad?"default":"pointer", fontFamily:"'Space Mono',monospace" }}>
               {aiLoad ? "⏳ ANALYZING..." : "🎯 AI FRONTRUN SIGNAL"}
             </button>
           )}
-          {aiSig && <AIPanel signal={aiSig} mode="frontrun" />}
+          {aiSig && <AIPanel signal={aiSig} mode="frontrun" lm={lm} />}
         </div>
       )}
     </div>
@@ -710,11 +832,26 @@ export default function App() {
   const [toasts,      setToasts]      = useState([]);
   const [scanCount,   setScanCount]   = useState(0);
   const [narrative,   setNarrative]   = useState("ALL");
+  const [lightMode,   setLightMode]   = useState(false);
+
+  const lm = lightMode;
+  const theme = {
+    bg:        lm ? "#f5f5f0" : "#06060e",
+    bgCard:    lm ? "#ffffff" : "linear-gradient(135deg,#070712,#0b0b1e)",
+    bgHeader:  lm ? "linear-gradient(180deg,#ffffff,#f5f5f0)" : "linear-gradient(180deg,#0a0a1c,#06060e)",
+    bgControl: lm ? "#efefea" : "#090915",
+    border:    lm ? "#e0e0d8" : "#0f0f22",
+    text:      lm ? "#111111" : "#ffffff",
+    textDim:   lm ? "#666666" : "#2a2a3a",
+    textFaint: lm ? "#aaaaaa" : "#0f0f20",
+    scrollBg:  lm ? "#e8e8e0" : "#080810",
+    scrollThumb: lm ? "#cccccc" : "#1e1e30",
+  };
 
   const intervalRef = useRef(null);
   const scanLockRef = useRef(false);
   const visibleRef  = useRef(true);
-  const everSeenRef = useRef({ clean: new Set(), frontrun: new Set() });
+  const everSeenRef = useRef({ clean: new Set(), gems: new Set(), frontrun: new Set() });
 
   useEffect(() => {
     const fn = () => { visibleRef.current = !document.hidden; };
@@ -736,12 +873,19 @@ export default function App() {
     try {
       const raw          = await fetchLiveTokens();
       const cleanList    = raw.filter(passesClean);
+      const gemsList     = raw.filter(passesGems);
       const frontrunList = raw.filter(passesFrontrun);
 
       for (const t of cleanList) {
         if (!everSeenRef.current.clean.has(t.mint)) {
           everSeenRef.current.clean.add(t.mint);
-          addToast(`${t.symbol} clean entry +${t.priceChange.toFixed(0)}% · Opp ${opportunityScore(t)}`, "clean");
+          addToast(`${t.symbol} clean entry · Opp ${opportunityScore(t)}`, "clean");
+        }
+      }
+      for (const t of gemsList) {
+        if (!everSeenRef.current.gems.has(t.mint)) {
+          everSeenRef.current.gems.add(t.mint);
+          addToast(`${t.symbol} gem found · MC ${fmtMcap(t.jupPrice) || "?"}`, "gems");
         }
       }
       for (const t of frontrunList) {
@@ -771,28 +915,37 @@ export default function App() {
     return () => clearInterval(intervalRef.current);
   }, [autoRefresh, scan]);
 
-  const { cleanTokens, frontrunTokens } = useMemo(() => {
+  const { cleanTokens, gemsTokens, frontrunTokens } = useMemo(() => {
     let clean    = allTokens.filter(passesClean);
+    let gems     = allTokens.filter(passesGems);
     let frontrun = allTokens.filter(passesFrontrun);
     if (narrative !== "ALL") {
       clean    = clean.filter(t => t.narrative === narrative);
+      gems     = gems.filter(t => t.narrative === narrative);
       frontrun = frontrun.filter(t => t.narrative === narrative);
     }
     clean.sort((a, b)    => opportunityScore(b) - opportunityScore(a));
+    gems.sort((a, b)     => opportunityScore(b) - opportunityScore(a));
     frontrun.sort((a, b) => (a.priceChange || 0) - (b.priceChange || 0));
-    return { cleanTokens: clean, frontrunTokens: frontrun };
+    return { cleanTokens: clean, gemsTokens: gems, frontrunTokens: frontrun };
   }, [allTokens, narrative]);
 
-  const displayed = tab === "clean" ? cleanTokens : frontrunTokens;
+  const displayed = tab === "clean" ? cleanTokens : tab === "gems" ? gemsTokens : frontrunTokens;
+
+  const tabDescriptions = {
+    clean:    "Fresh launches under 45min, MC $15K–$300K, bundle <55%, ≤6 insiders, no Jito. Sorted by opportunity score.",
+    gems:     "Up to 24hrs old, MC $50K–$1M, bundle <40%, ≤4 insiders, no Jito. Coins with traction still under $1M. Sorted by opportunity.",
+    frontrun: "Bundle confirmed but price under 40%. Get in before the pump. Most unpopped first. High risk — know your exit.",
+  };
 
   return (
-    <div style={{ minHeight:"100vh", background:"#06060e", fontFamily:"'Space Mono','Courier New',monospace", color:"#fff", paddingBottom:60 }}>
+    <div style={{ minHeight:"100vh", background:theme.bg, fontFamily:"'Space Mono','Courier New',monospace", color:theme.text, paddingBottom:60 }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
         ::-webkit-scrollbar{width:3px;height:3px}
-        ::-webkit-scrollbar-track{background:#080810}
-        ::-webkit-scrollbar-thumb{background:#1e1e30;border-radius:2px}
+        ::-webkit-scrollbar-track{background:${theme.scrollBg}}
+        ::-webkit-scrollbar-thumb{background:${theme.scrollThumb};border-radius:2px}
         @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
         @keyframes slideIn{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.25}}
@@ -802,33 +955,29 @@ export default function App() {
       <Toast toasts={toasts} onDismiss={id => setToasts(t => t.filter(x => x.id !== id))} />
 
       {/* ── Header ── */}
-      <div style={{ background:"linear-gradient(180deg,#0a0a1c,#06060e)", borderBottom:"1px solid #0f0f22", padding:"16px 20px 12px", position:"sticky", top:0, zIndex:100, backdropFilter:"blur(10px)" }}>
+      <div style={{ background:theme.bgHeader, borderBottom:`1px solid ${theme.border}`, padding:"16px 20px 12px", position:"sticky", top:0, zIndex:100, backdropFilter:"blur(10px)" }}>
         <div style={{ maxWidth:540, margin:"0 auto" }}>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
             <div>
               <div style={{ display:"flex", alignItems:"center", gap:7 }}>
                 <div style={{ width:7, height:7, borderRadius:"50%", background:autoRefresh?"#00ff88":"#ff3b3b", animation:"pulse 1.5s infinite" }} />
-                <span style={{ color:autoRefresh?"#00ff88":"#ff3b3b", fontSize:9, letterSpacing:2, fontWeight:700 }}>
+                <span style={{ color:autoRefresh?"#00bb66":"#ff3b3b", fontSize:9, letterSpacing:2, fontWeight:700 }}>
                   {loading ? "SCANNING..." : autoRefresh ? "AUTO-LIVE" : "PUMP.FUN SCANNER"}
                 </span>
               </div>
-              <div style={{ fontSize:22, fontWeight:700, letterSpacing:-1, lineHeight:1.1, marginTop:2 }}>
+              <div style={{ fontSize:22, fontWeight:700, letterSpacing:-1, lineHeight:1.1, marginTop:2, color:theme.text }}>
                 PUMP<span style={{ color:"#5bc0ff" }}>RADAR</span>
-                <span style={{ color:"#141428", fontSize:9, fontWeight:400, marginLeft:8, letterSpacing:2 }}>v3</span>
+                <span style={{ color:theme.textFaint, fontSize:9, fontWeight:400, marginLeft:8, letterSpacing:2 }}>v3</span>
               </div>
             </div>
-            <div style={{ textAlign:"right", display:"flex", flexDirection:"column", gap:4 }}>
-              {cleanTokens.length > 0 && (
-                <div style={{ background:"#001a0d", border:"1px solid #00ff8828", color:"#00ff88", fontSize:9, fontWeight:900, padding:"3px 10px", borderRadius:4, letterSpacing:1 }}>
-                  ⚡ {cleanTokens.length} CLEAN
-                </div>
-              )}
-              {frontrunTokens.length > 0 && (
-                <div style={{ background:"#1a0000", border:"1px solid #ff3b3b28", color:"#ff6666", fontSize:9, fontWeight:700, padding:"3px 10px", borderRadius:4, letterSpacing:1 }}>
-                  🎯 {frontrunTokens.length} FRONTRUN
-                </div>
-              )}
-              {lastScan && <div style={{ color:"#1a1a28", fontSize:8 }}>#{scanCount} · {lastScan.toLocaleTimeString()}</div>}
+            <div style={{ textAlign:"right", display:"flex", flexDirection:"column", gap:4, alignItems:"flex-end" }}>
+              <button onClick={() => setLightMode(m => !m)} style={{ background:lm?"#1a1a2a":"#f0f0e8", color:lm?"#aaa":"#555", border:"none", borderRadius:20, padding:"3px 10px", fontSize:8, fontWeight:900, cursor:"pointer", letterSpacing:1 }}>
+                {lm ? "🌙 DARK" : "☀ LIGHT"}
+              </button>
+              {cleanTokens.length > 0 && <div style={{ background:"#001a0d", border:"1px solid #00ff8828", color:"#00ff88", fontSize:9, fontWeight:900, padding:"3px 10px", borderRadius:4, letterSpacing:1 }}>⚡ {cleanTokens.length} CLEAN</div>}
+              {gemsTokens.length > 0  && <div style={{ background:"#1a1000", border:"1px solid #ffaa0028", color:"#ffaa00", fontSize:9, fontWeight:900, padding:"3px 10px", borderRadius:4, letterSpacing:1 }}>💎 {gemsTokens.length} GEMS</div>}
+              {frontrunTokens.length > 0 && <div style={{ background:"#1a0000", border:"1px solid #ff3b3b28", color:"#ff6666", fontSize:9, fontWeight:700, padding:"3px 10px", borderRadius:4, letterSpacing:1 }}>🎯 {frontrunTokens.length} FRONTRUN</div>}
+              {lastScan && <div style={{ color:theme.textFaint, fontSize:8 }}>#{scanCount} · {lastScan.toLocaleTimeString()}</div>}
             </div>
           </div>
         </div>
@@ -837,12 +986,12 @@ export default function App() {
       <div style={{ maxWidth:540, margin:"0 auto", padding:"14px 16px 0" }}>
 
         {/* ── Controls ── */}
-        <div style={{ background:"#090915", border:"1px solid #0f0f22", borderRadius:10, padding:12, marginBottom:12 }}>
+        <div style={{ background:theme.bgControl, border:`1px solid ${theme.border}`, borderRadius:10, padding:12, marginBottom:12 }}>
           <div style={{ display:"flex", gap:8 }}>
-            <button onClick={scan} disabled={loading} style={{ flex:1, padding:"9px 0", borderRadius:6, border:"none", cursor:loading?"default":"pointer", background:loading?"#0f0f20":"linear-gradient(135deg,#5bc0ff10,#00ff8810)", color:loading?"#222":"#00ff88", fontSize:10, fontWeight:900, letterSpacing:1, borderTop:`1px solid ${loading?"transparent":"#00ff8814"}` }}>
+            <button onClick={scan} disabled={loading} style={{ flex:1, padding:"9px 0", borderRadius:6, border:"none", cursor:loading?"default":"pointer", background:loading?(lm?"#e0e0d8":"#0f0f20"):"linear-gradient(135deg,#5bc0ff18,#00ff8818)", color:loading?(lm?"#aaa":"#222"):"#00bb66", fontSize:10, fontWeight:900, letterSpacing:1 }}>
               {loading ? "⏳ SCANNING..." : "⚡ SCAN NOW"}
             </button>
-            <button onClick={() => setAutoRefresh(a => !a)} style={{ padding:"9px 14px", borderRadius:6, border:"none", cursor:"pointer", background:autoRefresh?"#00ff8810":"#0f0f20", color:autoRefresh?"#00ff88":"#222", fontSize:9, fontWeight:900, letterSpacing:1 }}>
+            <button onClick={() => setAutoRefresh(a => !a)} style={{ padding:"9px 14px", borderRadius:6, border:"none", cursor:"pointer", background:autoRefresh?"#00ff8818":(lm?"#e0e0d8":"#0f0f20"), color:autoRefresh?"#00bb66":(lm?"#aaa":"#333"), fontSize:9, fontWeight:900, letterSpacing:1 }}>
               {autoRefresh ? "⏹ AUTO" : "▶ AUTO"}
             </button>
           </div>
@@ -857,62 +1006,59 @@ export default function App() {
         )}
 
         {/* ── Tabs ── */}
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:12 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:6, marginBottom:12 }}>
           {[
-            { key:"clean",    label:"✓ CLEAN ENTRIES", ac:"#00ff88", bg:"linear-gradient(135deg,#001a0d,#002a14)", cnt:cleanTokens.length,    cc:"#00ff8822", ct:"#00ff88" },
-            { key:"frontrun", label:"🎯 FRONTRUN",      ac:"#ff6666", bg:"linear-gradient(135deg,#1a0000,#2a0500)", cnt:frontrunTokens.length, cc:"#ff444422", ct:"#ff6666" },
+            { key:"clean",    label:"✓ CLEAN",   ac:"#00ff88", bg:lm?"#e8fff4":"linear-gradient(135deg,#001a0d,#002a14)", cnt:cleanTokens.length,    cc:"#00ff8822", ct:"#00bb66" },
+            { key:"gems",     label:"💎 GEMS",    ac:"#ffaa00", bg:lm?"#fff8e8":"linear-gradient(135deg,#1a1000,#2a1800)", cnt:gemsTokens.length,     cc:"#ffaa0022", ct:"#ffaa00" },
+            { key:"frontrun", label:"🎯 FRONTRUN", ac:"#ff6666", bg:lm?"#fff0f0":"linear-gradient(135deg,#1a0000,#2a0500)", cnt:frontrunTokens.length, cc:"#ff444422", ct:"#ff6666" },
           ].map(t => (
-            <button key={t.key} onClick={() => setTab(t.key)} style={{ padding:"12px 8px", borderRadius:8, border:"none", cursor:"pointer", background:tab===t.key?t.bg:"#090915", color:tab===t.key?t.ac:"#222", fontSize:9, fontWeight:900, letterSpacing:1.5, borderBottom:`2px solid ${tab===t.key?t.ac:"transparent"}`, transition:"all 0.2s" }}>
+            <button key={t.key} onClick={() => setTab(t.key)} style={{ padding:"10px 4px", borderRadius:8, border:"none", cursor:"pointer", background:tab===t.key?t.bg:(lm?"#efefea":"#090915"), color:tab===t.key?t.ac:(lm?"#aaa":"#333"), fontSize:8, fontWeight:900, letterSpacing:1, borderBottom:`2px solid ${tab===t.key?t.ac:"transparent"}`, transition:"all 0.2s" }}>
               {t.label}
-              {t.cnt > 0 && <span style={{ marginLeft:7, background:t.cc, color:t.ct, fontSize:9, padding:"1px 6px", borderRadius:10 }}>{t.cnt}</span>}
+              {t.cnt > 0 && <span style={{ marginLeft:5, background:t.cc, color:t.ct, fontSize:8, padding:"1px 5px", borderRadius:10 }}>{t.cnt}</span>}
             </button>
           ))}
         </div>
 
         {/* ── Tab description ── */}
-        <div style={{ background:tab==="clean"?"#001a0d0a":"#1a00000a", border:`1px solid ${tab==="clean"?"#00ff880a":"#ff44440a"}`, borderRadius:8, padding:"8px 12px", marginBottom:12 }}>
-          <p style={{ color:"#2a2a3a", fontSize:9, lineHeight:1.7, letterSpacing:0.3 }}>
-            {tab === "clean"
-              ? "Tokens passing all safety filters: bundle <55%, ≤6 insiders, top holders <55%, age <45min, ≥5 real buyers, slot cluster checked. Sorted by opportunity score."
-              : "Tokens with confirmed bundle activity where the price has NOT yet pumped (<40%). Most unpopped first — get in before the move. High risk, know your exit."}
-          </p>
+        <div style={{ background:lm?"#f0f0e8":"#08080f", border:`1px solid ${theme.border}`, borderRadius:8, padding:"8px 12px", marginBottom:12 }}>
+          <p style={{ color:theme.textDim, fontSize:9, lineHeight:1.7, letterSpacing:0.3 }}>{tabDescriptions[tab]}</p>
         </div>
 
         {/* ── Narrative filter ── */}
         <div style={{ display:"flex", gap:5, overflowX:"auto", marginBottom:12, scrollbarWidth:"none", msOverflowStyle:"none" }}>
           {["ALL","AI","MEME","TRUMP","DEPIN","GAMING","RWA"].map(n => (
-            <button key={n} onClick={() => setNarrative(n)} style={{ flexShrink:0, padding:"4px 11px", borderRadius:20, border:"none", cursor:"pointer", background:narrative===n?"#cc88ff14":"#0e0e1e", color:narrative===n?"#cc88ff":"#222", fontSize:8, fontWeight:900, letterSpacing:1.5 }}>{n}</button>
+            <button key={n} onClick={() => setNarrative(n)} style={{ flexShrink:0, padding:"4px 11px", borderRadius:20, border:"none", cursor:"pointer", background:narrative===n?"#cc88ff22":(lm?"#e8e8e0":"#0e0e1e"), color:narrative===n?"#cc88ff":(lm?"#888":"#333"), fontSize:8, fontWeight:900, letterSpacing:1.5 }}>{n}</button>
           ))}
         </div>
 
         {/* ── Token list ── */}
         {loading ? (
-          <div style={{ textAlign:"center", padding:"60px 0", color:"#141428" }}>
-            <div style={{ display:"inline-block", width:34, height:34, border:"2px solid #0f0f22", borderTop:"2px solid #5bc0ff", borderRadius:"50%", animation:"spin 0.7s linear infinite" }} />
+          <div style={{ textAlign:"center", padding:"60px 0", color:theme.textDim }}>
+            <div style={{ display:"inline-block", width:34, height:34, border:`2px solid ${theme.border}`, borderTop:"2px solid #5bc0ff", borderRadius:"50%", animation:"spin 0.7s linear infinite" }} />
             <div style={{ marginTop:12, fontSize:10, letterSpacing:2 }}>SCANNING PUMP.FUN...</div>
           </div>
         ) : displayed.length === 0 ? (
           <div style={{ textAlign:"center", padding:"50px 20px" }}>
-            <div style={{ color:"#141428", fontSize:11, letterSpacing:2, marginBottom:8 }}>
-              {tab === "clean" ? "NO CLEAN TOKENS" : "NO FRONTRUN TARGETS"}
+            <div style={{ color:theme.textDim, fontSize:11, letterSpacing:2, marginBottom:8 }}>
+              {tab === "clean" ? "NO CLEAN TOKENS" : tab === "gems" ? "NO GEMS FOUND" : "NO FRONTRUN TARGETS"}
             </div>
-            <div style={{ color:"#0f0f20", fontSize:9, lineHeight:1.9 }}>
-              {tab === "clean"
-                ? "All tokens failed safety filters. Strict gates protect your capital — scan again soon."
-                : "No active bundle windows. Enable auto-refresh to catch them as they appear."}
+            <div style={{ color:theme.textFaint, fontSize:9, lineHeight:1.9 }}>
+              {tab === "clean" ? "All tokens failed safety filters. Scan again soon."
+               : tab === "gems" ? "No coins in the $50K–$300K range right now. Try again shortly."
+               : "No active bundle windows. Enable auto-refresh to catch them."}
             </div>
-            <button onClick={scan} style={{ marginTop:16, padding:"8px 20px", borderRadius:6, border:"1px solid #0f0f22", background:"transparent", color:"#222", fontSize:9, fontWeight:900, cursor:"pointer", letterSpacing:1 }}>SCAN AGAIN</button>
+            <button onClick={scan} style={{ marginTop:16, padding:"8px 20px", borderRadius:6, border:`1px solid ${theme.border}`, background:"transparent", color:theme.textDim, fontSize:9, fontWeight:900, cursor:"pointer", letterSpacing:1 }}>SCAN AGAIN</button>
           </div>
         ) : (
           <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
-            {tab === "clean"
-              ? displayed.map((t, i) => <CleanCard key={t.mint} token={t} rank={i+1} />)
-              : displayed.map((t, i) => <FrontrunCard key={t.mint} token={t} rank={i+1} />)
+            {tab === "frontrun"
+              ? displayed.map((t, i) => <FrontrunCard key={t.mint} token={t} rank={i+1} lm={lm} />)
+              : displayed.map((t, i) => <CleanCard key={t.mint} token={t} rank={i+1} lm={lm} />)
             }
           </div>
         )}
 
-        <div style={{ marginTop:28, textAlign:"center", color:"#0f0f20", fontSize:8, letterSpacing:1.5, lineHeight:2.2 }}>
+        <div style={{ marginTop:28, textAlign:"center", color:theme.textFaint, fontSize:8, letterSpacing:1.5, lineHeight:2.2 }}>
           PUMPRADAR v3 · LIVE VIA HELIUS + JUPITER<br/>
           RESEARCH ONLY · NOT FINANCIAL ADVICE · DYOR
         </div>
