@@ -698,15 +698,6 @@ function FrontrunCard({ token, rank, lm = false }) {
     [token.mint, token.ageMinutes, token.jitoDetected, token.firstSeen]);
   const uc = winSecs <= 60 ? "#ff3b3b" : winSecs <= 180 ? "#ffaa00" : "#5bc0ff";
   const cardBg    = lm ? "#ffffff" : "linear-gradient(135deg,#0e0707,#160b0b)";
-  const statBg    = lm ? "#f5f5f0" : "#050510";
-  const statBorder = lm ? "#e0e0d8" : "#0f0f20";
-  const windowBg  = lm ? "#fff8f8" : "#08030a";
-  const textMain  = lm ? "#111" : "#fff";
-  const textDim   = lm ? "#666" : "#333";
-  const textMuted = lm ? "#999" : "#2a2a3a";
-  const divider   = lm ? "#e8e0e0" : "#150808";
-  const walletBg  = lm ? "#fff0f0" : "#060610";
-  const uc = winSecs <= 60 ? "#ff3b3b" : winSecs <= 180 ? "#ffaa00" : "#5bc0ff";
 
   return (
     <div
