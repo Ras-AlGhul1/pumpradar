@@ -143,17 +143,12 @@ function passesClean(token) {
 }
 
 function passesGems(token) {
-  if (token.bundleScore      >  GEMS_FILTERS.MAX_BUNDLE_SCORE)    return false;
-  if (token.insiderCount     >  GEMS_FILTERS.MAX_INSIDERS)        return false;
-  if (token.topHolderConc    >  GEMS_FILTERS.MAX_TOP_HOLDER_CONC) return false;
-  if (token.ageMinutes       >  GEMS_FILTERS.MAX_AGE_MINUTES)     return false;
-  if (token.uniqueBuyers     <  GEMS_FILTERS.MIN_UNIQUE_BUYERS)   return false;
-  if (token.jitoDetected)                                         return false;
-  if (opportunityScore(token) < GEMS_FILTERS.MIN_OPP_SCORE)       return false;
   const mcap = getMcap(token);
-  if (mcap == null)                                               return false; // must have price data
+  if (mcap == null)                                               return false; // must have price
   if (mcap < GEMS_FILTERS.MIN_MCAP_USD)                          return false;
   if (mcap > GEMS_FILTERS.MAX_MCAP_USD)                          return false;
+  if (token.ageMinutes       >  GEMS_FILTERS.MAX_AGE_MINUTES)    return false;
+  if (opportunityScore(token) < GEMS_FILTERS.MIN_OPP_SCORE)      return false;
   return true;
 }
 
@@ -439,7 +434,7 @@ SIGNAL: [FRONTRUN NOW / RISKY FRONTRUN / AVOID]
 WINDOW: [one sentence on how long you have and urgency]
 STRATEGY: [one sentence — exact action: buy X% position, target Y% gain, exit if Z]`;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("/api/pumpradar/ai", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -687,6 +682,88 @@ function CleanCard({ token, rank, lm = false }) {
   );
 }
 
+// ─── GEM CARD (same as CleanCard but with gem branding) ──────────────────────
+function GemCard({ token, rank, lm = false }) {
+  const [expanded, setExpanded] = useState(false);
+  const [aiSig, setAiSig]       = useState(null);
+  const [aiLoad, setAiLoad]     = useState(false);
+  const risk = useMemo(() => computeRisk(token), // eslint-disable-line react-hooks/exhaustive-deps
+    [token.mint, token.insiderCount, token.bundleScore, token.topHolderConc, token.ageMinutes, token.jitoDetected, token.slotClusterScore]);
+  const opp  = useMemo(() => opportunityScore(token), // eslint-disable-line react-hooks/exhaustive-deps
+    [token.mint, token.priceChange, token.uniqueBuyers, token.ageMinutes, risk]);
+  const ac   = "#ffaa00";
+  const cardBg   = lm ? "#ffffff" : "linear-gradient(135deg,#12100a,#1a1408)";
+  const cardBorder = lm ? "#e8e0d0" : "#ffaa0012";
+  const statBg   = lm ? "#f5f5f0" : "#0e0c06";
+  const statBorder = lm ? "#e0e0d8" : "#1a1408";
+  const textMain = lm ? "#111" : "#fff";
+  const textDim  = lm ? "#666" : "#333";
+  const textMuted = lm ? "#999" : "#2a2a3a";
+  const dividerColor = lm ? "#e8e8e0" : "#1a1408";
+
+  return (
+    <div
+      onClick={() => setExpanded(e => !e)}
+      style={{ background:cardBg, border:`1px solid ${cardBorder}`, borderLeft:`3px solid ${ac}`, borderRadius:10, padding:"14px 16px", cursor:"pointer", position:"relative", overflow:"hidden", transition:"box-shadow 0.2s" }}
+      onMouseEnter={e => e.currentTarget.style.boxShadow = lm ? "0 2px 16px #00000018" : "0 0 24px #ffaa0014"}
+      onMouseLeave={e => e.currentTarget.style.boxShadow = "none"}
+    >
+      <div style={{ position:"absolute", top:0, left:0, right:0, height:1, background:`linear-gradient(90deg,transparent,${ac}22,transparent)`, pointerEvents:"none" }} />
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ width:32, height:32, borderRadius:"50%", background:`conic-gradient(${ac} 0deg,${lm?"#e8e8e0":"#0d0d1e"} 360deg)`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:900, color:ac, flexShrink:0 }}>#{rank}</div>
+          <div>
+            <div style={{ display:"flex", alignItems:"center", gap:5, flexWrap:"wrap" }}>
+              <span style={{ color:textMain, fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>{token.symbol}</span>
+              {token.narrative && <NarrativeTag tag={token.narrative} />}
+              <Tag bg={lm?"#fff8e8":"#1a1000"} color="#ffaa00">💎 GEM</Tag>
+              {token.jitoDetected && <Tag bg={lm?"#fff0f0":"#1a0000"} color="#ff4444">⚡ JITO</Tag>}
+            </div>
+            <div style={{ color:textDim, fontSize:10, marginTop:2 }}>{token.name}</div>
+          </div>
+        </div>
+        <div style={{ textAlign:"right", flexShrink:0 }}>
+          <div style={{ color:ac, fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>+{token.priceChange.toFixed(1)}%</div>
+          <div style={{ color:textMuted, fontSize:9, marginTop:1 }}>{token.ageMinutes}m old</div>
+          {token.jupPrice != null && <div style={{ color:"#5bc0ff", fontSize:9, marginTop:1 }}>{fmtJup(token.jupPrice)}</div>}
+          {fmtMcap(token.jupPrice) && <div style={{ color:ac, fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token.jupPrice)}</div>}
+        </div>
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:5, marginTop:10 }}>
+        {[
+          { l:"INSIDERS", v:token.insiderCount,                         c:token.insiderCount > 3 ? "#ff4444" : token.insiderCount > 1 ? "#ffaa00" : "#00aa66" },
+          { l:"BUNDLE",   v:`${(token.bundleScore*100).toFixed(0)}%`,   c:token.bundleScore > 0.4 ? "#ffaa00" : "#00aa66" },
+          { l:"AGE",      v:`${token.ageMinutes}m`,                     c:token.ageMinutes > 60 ? "#ffaa00" : "#00aa66" },
+          { l:"BUYERS",   v:token.uniqueBuyers,                         c:"#5bc0ff" },
+        ].map(s => (
+          <div key={s.l} style={{ background:statBg, borderRadius:6, padding:"6px 8px", border:`1px solid ${statBorder}` }}>
+            <div style={{ color:textMuted, fontSize:8, letterSpacing:1 }}>{s.l}</div>
+            <div style={{ color:s.c, fontWeight:700, fontSize:12, fontFamily:"'Space Mono',monospace" }}>{s.v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:10 }}>
+        <Bar value={risk} color={RC(risk)} label="RISK" lm={lm} />
+        <Bar value={opp}  color={OC(opp)}  label="OPPORTUNITY" lm={lm} />
+      </div>
+      {expanded && (
+        <div style={{ marginTop:12, paddingTop:12, borderTop:`1px solid ${dividerColor}`, animation:"fadeIn 0.2s ease" }}>
+          <ExtLinks mint={token.mint} lm={lm} />
+          {!aiSig && (
+            <button
+              onClick={async e => { e.stopPropagation(); setAiLoad(true); try { setAiSig(await getAISignal(token,"clean")); } catch(err) { setAiSig({ signal:"ERROR", entry: err.message || "API call failed.", exit:"" }); } setAiLoad(false); }}
+              disabled={aiLoad}
+              style={{ width:"100%", padding:"9px 0", background:aiLoad?(lm?"#e8e8e0":"#0f0f20"):(lm?"linear-gradient(135deg,#fff8e8,#fff0d8)":"linear-gradient(135deg,#1a1000,#2a1800)"), border:`1px solid ${lm?"#ffaa0044":"#ffaa0018"}`, borderRadius:8, color:aiLoad?(lm?"#aaa":"#2a2a3a"):(lm?"#aa6600":"#ffaa00"), fontSize:9, fontWeight:900, letterSpacing:1.5, cursor:aiLoad?"default":"pointer", fontFamily:"'Space Mono',monospace" }}>
+              {aiLoad ? "⏳ ANALYZING..." : "💎 AI GEM SIGNAL"}
+            </button>
+          )}
+          {aiSig && <AIPanel signal={aiSig} mode="clean" lm={lm} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── FRONTRUN CARD ────────────────────────────────────────────────────────────
 function FrontrunCard({ token, rank, lm = false }) {
   const [expanded, setExpanded] = useState(false);
@@ -698,6 +775,14 @@ function FrontrunCard({ token, rank, lm = false }) {
     [token.mint, token.ageMinutes, token.jitoDetected, token.firstSeen]);
   const uc = winSecs <= 60 ? "#ff3b3b" : winSecs <= 180 ? "#ffaa00" : "#5bc0ff";
   const cardBg    = lm ? "#ffffff" : "linear-gradient(135deg,#0e0707,#160b0b)";
+  const statBg    = lm ? "#f5f5f0" : "#050510";
+  const statBorder = lm ? "#e0e0d8" : "#0f0f20";
+  const windowBg  = lm ? "#fff8f8" : "#08030a";
+  const textMain  = lm ? "#111" : "#fff";
+  const textDim   = lm ? "#666" : "#333";
+  const textMuted = lm ? "#999" : "#2a2a3a";
+  const divider   = lm ? "#e8e0e0" : "#150808";
+  const walletBg  = lm ? "#fff0f0" : "#060610";
 
   return (
     <div
@@ -1044,6 +1129,8 @@ export default function App() {
           <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
             {tab === "frontrun"
               ? displayed.map((t, i) => <FrontrunCard key={t.mint} token={t} rank={i+1} lm={lm} />)
+              : tab === "gems"
+              ? displayed.map((t, i) => <GemCard key={t.mint} token={t} rank={i+1} lm={lm} />)
               : displayed.map((t, i) => <CleanCard key={t.mint} token={t} rank={i+1} lm={lm} />)
             }
           </div>
