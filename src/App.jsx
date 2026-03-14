@@ -28,18 +28,17 @@ const CLEAN_FILTERS = {
   MAX_INSIDERS:        6,
   MAX_TOP_HOLDER_CONC: 0.55,
   MAX_AGE_MINUTES:     45,
-  MIN_UNIQUE_BUYERS:   5,
-  MIN_PRICE_CHANGE:    10,
-  MIN_OPP_SCORE:       45,
+  MIN_UNIQUE_BUYERS:   2,
+  MIN_OPP_SCORE:       35,
 };
 
 // ─── FRONTRUN TAB FILTERS ─────────────────────────────────────────────────────
 // Catches coins where bundle is confirmed but price hasn't pumped yet
 const FRONTRUN_FILTERS = {
   MIN_BUNDLE_SCORE:  0.40,
-  MAX_AGE_MINUTES:   20,
-  MAX_PRICE_CHANGE:  40,   // price NOT yet pumped — under 40% means still early
-  MIN_UNIQUE_BUYERS: 3,
+  MAX_AGE_MINUTES:   30,  // extended — coins may be seen late
+  MAX_PRICE_CHANGE:  40,
+  MIN_UNIQUE_BUYERS: 2,
 };
 
 // ─── NARRATIVES ───────────────────────────────────────────────────────────────
@@ -99,14 +98,13 @@ function computeRisk(token) {
 }
 
 // ─── OPPORTUNITY SCORE ────────────────────────────────────────────────────────
-// Weights sum to exactly 1.0: safety 0.35 + momentum 0.35 + fresh 0.20 + demand 0.10
+// Weights sum to exactly 1.0: safety 0.50 + fresh 0.30 + demand 0.20
 function opportunityScore(token) {
   const risk        = computeRisk(token);
   const safetyPct   = (100 - risk) / 100;
-  const momentumPct = Math.min(token.priceChange || 0, 3000) / 3000;
   const freshPct    = Math.max(0, 1 - (token.ageMinutes || 30) / 30);
-  const demandPct   = Math.min(1, (token.uniqueBuyers || 0) / 50);
-  const raw = safetyPct * 0.35 + momentumPct * 0.35 + freshPct * 0.20 + demandPct * 0.10;
+  const demandPct   = Math.min(1, (token.uniqueBuyers || 0) / 20);
+  const raw = safetyPct * 0.50 + freshPct * 0.30 + demandPct * 0.20;
   return Math.min(100, Math.round(raw * 100));
 }
 
@@ -117,8 +115,6 @@ function passesClean(token) {
   if (token.topHolderConc    >  CLEAN_FILTERS.MAX_TOP_HOLDER_CONC) return false;
   if (token.ageMinutes       >  CLEAN_FILTERS.MAX_AGE_MINUTES)     return false;
   if (token.uniqueBuyers     <  CLEAN_FILTERS.MIN_UNIQUE_BUYERS)   return false;
-  // Only apply price change filter if we have real data (not first scan)
-  if (token.hasPriceHistory && (token.priceChange||0) < CLEAN_FILTERS.MIN_PRICE_CHANGE) return false;
   if (token.jitoDetected)                                          return false;
   if (opportunityScore(token) < CLEAN_FILTERS.MIN_OPP_SCORE)       return false;
   return true;
@@ -135,7 +131,7 @@ function passesFrontrun(token) {
 
 // ─── FRONTRUN WINDOW ─────────────────────────────────────────────────────────
 function frontrunWindowSecs(token) {
-  const baseWindow  = token.jitoDetected ? 180 : 300;
+  const baseWindow  = token.jitoDetected ? 300 : 600; // extended windows
   const birthMs     = token.firstSeen || (Date.now() - (token.ageMinutes || 0) * 60000);
   const elapsedSecs = (Date.now() - birthMs) / 1000;
   return Math.max(0, baseWindow - elapsedSecs);
@@ -218,6 +214,7 @@ async function fetchLiveTokens() {
           totalVolume: 0, bundleVolumeSol: 0, jitoDetected: false, jitoTxCount: 0,
           jitoSigsSeen: new Set(),
           slotSigsSeen: new Set(),
+          bundleVolSigsSeen: new Set(), // dedupe bundle volume per tx
           rawTxs: [],
         };
       }
@@ -232,7 +229,11 @@ async function fetchLiveTokens() {
       tokenMap[mint].totalVolume += swap.tokenAmount || 0;
       if (isJito) {
         tokenMap[mint].jitoDetected = true;
-        tokenMap[mint].bundleVolumeSol += solMoved;
+        // Only add bundle volume once per tx to avoid multiplying by swap count
+        if (!tokenMap[mint].bundleVolSigsSeen.has(tx.signature)) {
+          tokenMap[mint].bundleVolSigsSeen.add(tx.signature);
+          tokenMap[mint].bundleVolumeSol += solMoved;
+        }
         if (!tokenMap[mint].jitoSigsSeen.has(tx.signature)) {
           tokenMap[mint].jitoSigsSeen.add(tx.signature);
           tokenMap[mint].jitoTxCount++;
@@ -323,7 +324,7 @@ async function fetchLiveTokens() {
       insiderCount:     Math.min(insiderSet.size, 8),
       bundleScore:      +bundleScore.toFixed(3),
       slotClusterScore: +slotCluster.toFixed(3),
-      topHolderConc:    0.18 + Math.random() * 0.38,
+      topHolderConc:    0.30, // conservative fixed estimate — real data needs on-chain holder fetch
       ageMinutes,
       firstSeen:        token.firstSeen,
       jitoDetected:     token.jitoDetected,
