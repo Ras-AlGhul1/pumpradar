@@ -24,20 +24,21 @@ const JITO_TIP_ACCOUNTS = new Set([
 
 // ─── PROFITABILITY HARD FILTERS (clean tab) ───────────────────────────────────
 const CLEAN_FILTERS = {
-  MAX_BUNDLE_SCORE:    0.30,
-  MAX_INSIDERS:        3,
-  MAX_TOP_HOLDER_CONC: 0.42,
-  MAX_AGE_MINUTES:     25,
-  MIN_UNIQUE_BUYERS:   8,
-  MIN_PRICE_CHANGE:    15,
-  MIN_OPP_SCORE:       55,
+  MAX_BUNDLE_SCORE:    0.55,
+  MAX_INSIDERS:        6,
+  MAX_TOP_HOLDER_CONC: 0.55,
+  MAX_AGE_MINUTES:     45,
+  MIN_UNIQUE_BUYERS:   5,
+  MIN_PRICE_CHANGE:    10,
+  MIN_OPP_SCORE:       45,
 };
 
 // ─── FRONTRUN TAB FILTERS ─────────────────────────────────────────────────────
+// Catches coins where bundle is confirmed but price hasn't pumped yet
 const FRONTRUN_FILTERS = {
   MIN_BUNDLE_SCORE:  0.40,
-  MAX_AGE_MINUTES:   15,
-  MIN_PRICE_CHANGE:  20,
+  MAX_AGE_MINUTES:   20,
+  MAX_PRICE_CHANGE:  40,   // price NOT yet pumped — under 40% means still early
   MIN_UNIQUE_BUYERS: 3,
 };
 
@@ -125,7 +126,7 @@ function passesClean(token) {
 function passesFrontrun(token) {
   if (token.bundleScore      <  FRONTRUN_FILTERS.MIN_BUNDLE_SCORE)  return false;
   if (token.ageMinutes       >  FRONTRUN_FILTERS.MAX_AGE_MINUTES)   return false;
-  if ((token.priceChange||0) <  FRONTRUN_FILTERS.MIN_PRICE_CHANGE)  return false;
+  if ((token.priceChange||0) >  FRONTRUN_FILTERS.MAX_PRICE_CHANGE)  return false; // price not yet pumped
   if (token.uniqueBuyers     <  FRONTRUN_FILTERS.MIN_UNIQUE_BUYERS)  return false;
   if (frontrunWindowSecs(token) <= 0)                                return false;
   return true;
@@ -403,6 +404,29 @@ function CountdownTimer({ initialSeconds }) {
   return <span style={{ color, fontWeight:900, fontFamily:"'Space Mono',monospace", fontSize:13 }}>{fmtSecs(rem)}</span>;
 }
 
+function CopyCA({ mint }) {
+  const [copied, setCopied] = useState(false);
+  const copy = (e) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(mint).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+  return (
+    <div
+      onClick={copy}
+      style={{ display:"flex", alignItems:"center", justifyContent:"space-between", background:"#08080f", border:`1px solid ${copied ? "#00ff8844" : "#1a1a2a"}`, borderRadius:6, padding:"7px 10px", marginBottom:8, cursor:"pointer", transition:"border 0.2s" }}
+    >
+      <span style={{ color:"#2a2a3a", fontSize:8, letterSpacing:1, fontFamily:"'Space Mono',monospace", flexShrink:0, marginRight:8 }}>CA</span>
+      <span style={{ color:"#444", fontSize:8, fontFamily:"'Space Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1 }}>{mint}</span>
+      <span style={{ color: copied ? "#00ff88" : "#333", fontSize:8, fontWeight:900, letterSpacing:1, flexShrink:0, marginLeft:8, fontFamily:"'Space Mono',monospace" }}>
+        {copied ? "✓ COPIED" : "COPY"}
+      </span>
+    </div>
+  );
+}
+
 function ExtLinks({ mint }) {
   const links = [
     { href:`https://pump.fun/coin/${mint}`,          label:"PUMP.FUN", bg:"#0d1f0d", color:"#00ff88" },
@@ -410,14 +434,17 @@ function ExtLinks({ mint }) {
     { href:`https://solscan.io/token/${mint}`,        label:"SOLSCAN", bg:"#0d0d2a", color:"#5bc0ff" },
   ];
   return (
-    <div style={{ display:"flex", gap:8, marginBottom:10 }}>
-      {links.map(l => (
-        <a key={l.label} href={l.href} target="_blank" rel="noopener noreferrer"
-          onClick={e => e.stopPropagation()}
-          style={{ flex:1, textAlign:"center", background:l.bg, color:l.color, border:`1px solid ${l.color}22`, borderRadius:6, padding:"7px 0", fontSize:8, fontWeight:900, textDecoration:"none", letterSpacing:0.5, fontFamily:"'Space Mono',monospace" }}>
-          {l.label} ↗
-        </a>
-      ))}
+    <div style={{ marginBottom:10 }}>
+      <CopyCA mint={mint} />
+      <div style={{ display:"flex", gap:8 }}>
+        {links.map(l => (
+          <a key={l.label} href={l.href} target="_blank" rel="noopener noreferrer"
+            onClick={e => e.stopPropagation()}
+            style={{ flex:1, textAlign:"center", background:l.bg, color:l.color, border:`1px solid ${l.color}22`, borderRadius:6, padding:"7px 0", fontSize:8, fontWeight:900, textDecoration:"none", letterSpacing:0.5, fontFamily:"'Space Mono',monospace" }}>
+            {l.label} ↗
+          </a>
+        ))}
+      </div>
     </div>
   );
 }
@@ -689,7 +716,7 @@ export default function App() {
 
   useEffect(() => {
     clearInterval(intervalRef.current);
-    if (autoRefresh) intervalRef.current = setInterval(() => { if (visibleRef.current) scan(); }, 30000);
+    if (autoRefresh) intervalRef.current = setInterval(() => { if (visibleRef.current) scan(); }, 20000);
     return () => clearInterval(intervalRef.current);
   }, [autoRefresh, scan]);
 
@@ -701,7 +728,7 @@ export default function App() {
       frontrun = frontrun.filter(t => t.narrative === narrative);
     }
     clean.sort((a, b)    => opportunityScore(b) - opportunityScore(a));
-    frontrun.sort((a, b) => frontrunWindowSecs(a) - frontrunWindowSecs(b));
+    frontrun.sort((a, b) => (a.priceChange || 0) - (b.priceChange || 0));
     return { cleanTokens: clean, frontrunTokens: frontrun };
   }, [allTokens, narrative]);
 
@@ -795,8 +822,8 @@ export default function App() {
         <div style={{ background:tab==="clean"?"#001a0d0a":"#1a00000a", border:`1px solid ${tab==="clean"?"#00ff880a":"#ff44440a"}`, borderRadius:8, padding:"8px 12px", marginBottom:12 }}>
           <p style={{ color:"#2a2a3a", fontSize:9, lineHeight:1.7, letterSpacing:0.3 }}>
             {tab === "clean"
-              ? "Tokens passing all safety filters: bundle <30%, ≤3 insiders, top holders <42%, age <25min, ≥8 real buyers, no Jito confirmed, slot cluster checked. Sorted by opportunity score."
-              : "Tokens with confirmed bundle/Jito activity where the frontrun window is still open. Most urgent first. High risk — know your exit before entering."}
+              ? "Tokens passing all safety filters: bundle <55%, ≤6 insiders, top holders <55%, age <45min, ≥5 real buyers, slot cluster checked. Sorted by opportunity score."
+              : "Tokens with confirmed bundle activity where the price has NOT yet pumped (<40%). Most unpopped first — get in before the move. High risk, know your exit."}
           </p>
         </div>
 
