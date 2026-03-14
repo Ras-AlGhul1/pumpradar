@@ -117,7 +117,8 @@ function passesClean(token) {
   if (token.topHolderConc    >  CLEAN_FILTERS.MAX_TOP_HOLDER_CONC) return false;
   if (token.ageMinutes       >  CLEAN_FILTERS.MAX_AGE_MINUTES)     return false;
   if (token.uniqueBuyers     <  CLEAN_FILTERS.MIN_UNIQUE_BUYERS)   return false;
-  if ((token.priceChange||0) <  CLEAN_FILTERS.MIN_PRICE_CHANGE)    return false;
+  // Only apply price change filter if we have real data (not first scan)
+  if (token.hasPriceHistory && (token.priceChange||0) < CLEAN_FILTERS.MIN_PRICE_CHANGE) return false;
   if (token.jitoDetected)                                          return false;
   if (opportunityScore(token) < CLEAN_FILTERS.MIN_OPP_SCORE)       return false;
   return true;
@@ -140,6 +141,37 @@ function frontrunWindowSecs(token) {
   return Math.max(0, baseWindow - elapsedSecs);
 }
 
+// ─── KNOWN NON-PUMP MINTS TO EXCLUDE ─────────────────────────────────────────
+const EXCLUDED_MINTS = new Set([
+  "So11111111111111111111111111111111111111112",  // Wrapped SOL
+  "So11111111111111111111111111111111111111111",  // Native SOL
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+  "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  // mSOL
+]);
+
+const MIN_BUNDLE_VOLUME_USD = 1000; // minimum $1000 in bundle volume
+
+// ─── PRICE HISTORY STORE ─────────────────────────────────────────────────────
+// Stores { price, timestamp } per mint across scans to compute real % change
+const priceHistory = {};
+
+function recordPrice(mint, price) {
+  if (price == null) return;
+  if (!priceHistory[mint]) {
+    priceHistory[mint] = { firstPrice: price, firstSeen: Date.now(), lastPrice: price };
+  } else {
+    priceHistory[mint].lastPrice = price;
+  }
+}
+
+function getRealPriceChange(mint, currentPrice) {
+  if (currentPrice == null) return null;
+  const h = priceHistory[mint];
+  if (!h || h.firstPrice == null || h.firstPrice === 0) return null;
+  return +((( currentPrice - h.firstPrice) / h.firstPrice) * 100).toFixed(1);
+}
+
 // ─── LIVE FETCH (via backend proxy — no CORS issues) ─────────────────────────
 async function fetchLiveTokens() {
   // 1. Recent Pump.fun signatures via proxy
@@ -149,7 +181,7 @@ async function fetchLiveTokens() {
     body: JSON.stringify({
       jsonrpc: "2.0", id: 1,
       method: "getSignaturesForAddress",
-      params: [PUMP_FUN_PROGRAM, { limit: 150 }],
+      params: [PUMP_FUN_PROGRAM, { limit: 200 }],
     }),
   });
   if (!txRes.ok) throw new Error(`RPC failed (${txRes.status}) — is the proxy running?`);
@@ -161,7 +193,7 @@ async function fetchLiveTokens() {
   const parseRes = await fetch(PROXY_TX, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ transactions: sigs.slice(0, 25) }),
+    body: JSON.stringify({ transactions: sigs.slice(0, 50) }),
   });
   if (!parseRes.ok) throw new Error(`Enhanced TX failed (${parseRes.status})`);
   const parsed = await parseRes.json();
@@ -172,15 +204,18 @@ async function fetchLiveTokens() {
   for (const tx of parsed) {
     const nativeTransfers = tx.nativeTransfers || [];
     const isJito = nativeTransfers.some(t => JITO_TIP_ACCOUNTS.has(t.toUserAccount));
+    // Sum SOL moved in native transfers as proxy for bundle volume
+    const solMoved = nativeTransfers.reduce((sum, t) => sum + (t.amount || 0), 0) / 1e9;
 
     for (const swap of (tx.tokenTransfers || [])) {
       const mint = swap.mint;
       if (!mint) continue;
+      if (EXCLUDED_MINTS.has(mint)) continue; // skip SOL, USDC, USDT etc
       if (!tokenMap[mint]) {
         tokenMap[mint] = {
           mint, buyerSet: new Set(), txSlots: [],
           txCount: 0, firstSeen: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
-          totalVolume: 0, jitoDetected: false, jitoTxCount: 0,
+          totalVolume: 0, bundleVolumeSol: 0, jitoDetected: false, jitoTxCount: 0,
           jitoSigsSeen: new Set(),
           slotSigsSeen: new Set(),
           rawTxs: [],
@@ -197,6 +232,7 @@ async function fetchLiveTokens() {
       tokenMap[mint].totalVolume += swap.tokenAmount || 0;
       if (isJito) {
         tokenMap[mint].jitoDetected = true;
+        tokenMap[mint].bundleVolumeSol += solMoved;
         if (!tokenMap[mint].jitoSigsSeen.has(tx.signature)) {
           tokenMap[mint].jitoSigsSeen.add(tx.signature);
           tokenMap[mint].jitoTxCount++;
@@ -209,7 +245,17 @@ async function fetchLiveTokens() {
     }
   }
 
-  const mints = Object.keys(tokenMap).slice(0, 12);
+  // Filter out mints with insufficient bundle volume (approx $1000 at ~$150/SOL)
+  const SOL_PRICE_APPROX = 150;
+  const minBundleSol = MIN_BUNDLE_VOLUME_USD / SOL_PRICE_APPROX;
+  const mints = Object.keys(tokenMap)
+    .filter(mint => {
+      const t = tokenMap[mint];
+      // If bundled, must meet min volume; if not bundled, always include
+      if (t.jitoDetected && t.bundleVolumeSol < minBundleSol) return false;
+      return true;
+    })
+    .slice(0, 25);
   if (!mints.length) throw new Error("No token mints found in parsed transactions");
 
   // 4. Enrich with metadata via proxy
@@ -239,7 +285,10 @@ async function fetchLiveTokens() {
     const slotCluster  = computeSlotClusterScore(token.txSlots);
     const bundleScore  = computeBundleScore(token.txCount, uniqueBuyers.length, slotCluster);
     const jupPrice     = prices[mint]?.price ?? null;
-    const priceChange  = +(Math.random() * 900 + 20).toFixed(1);
+    // Record price for future scans and compute real % change
+    recordPrice(mint, jupPrice);
+    const realChange   = getRealPriceChange(mint, jupPrice);
+    const priceChange  = realChange ?? 0; // 0 if no history yet (first scan)
 
     // Sort timestamped txs for early buyer detection; exclude null-timestamp txs
     const sortedTxs = [...token.rawTxs]
@@ -281,6 +330,7 @@ async function fetchLiveTokens() {
       jitoTxCount:      token.jitoTxCount,
       isBundled:        bundleScore > 0.4,
       priceChange,
+      hasPriceHistory:  realChange !== null,
       jupPrice,
       volume:           token.totalVolume,
       txCount:          token.txCount,
