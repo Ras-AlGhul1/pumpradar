@@ -8,6 +8,28 @@ const app = express()
 const KEY = process.env.HELIUS_API_KEY || '30ec2243-f612-45e5-a461-408e71dd50df'
 const PORT = process.env.PORT || 3001
 
+// Body parsing must come before routes that need req.body
+app.use(express.json())
+
+// AI proxy — must be BEFORE http-proxy-middleware routes
+app.post('/api/pumpradar/ai', async (req, res) => {
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY || '',
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(req.body),
+    })
+    const data = await response.json()
+    res.status(response.status).json(data)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 app.use('/api/pumpradar/rpc', createProxyMiddleware({
   target: 'https://mainnet.helius-rpc.com',
   changeOrigin: true,
@@ -44,7 +66,6 @@ app.use('/api/pumpradar/price', createProxyMiddleware({
   pathRewrite: { '^/api/pumpradar/price': '/v4/price' },
 }))
 
-// Serve the built React app
 app.use(express.static(join(__dirname, 'dist')))
 app.get('/{*path}', (req, res) => {
   res.sendFile(join(__dirname, 'dist', 'index.html'))
