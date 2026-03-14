@@ -222,15 +222,25 @@ function getRealPriceChange(mint, currentPrice) {
 // ─── LIVE FETCH (via backend proxy — no CORS issues) ─────────────────────────
 async function fetchLiveTokens() {
   // 1. Recent Pump.fun signatures via proxy
-  const txRes = await fetch(PROXY_RPC, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0", id: 1,
-      method: "getSignaturesForAddress",
-      params: [PUMP_FUN_PROGRAM, { limit: 100 }],
-    }),
-  });
+  const rpcController = new AbortController();
+  const rpcTimeout = setTimeout(() => rpcController.abort(), 8000);
+  let txRes;
+  try {
+    txRes = await fetch(PROXY_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1,
+        method: "getSignaturesForAddress",
+        params: [PUMP_FUN_PROGRAM, { limit: 100 }],
+      }),
+      signal: rpcController.signal,
+    });
+  } catch (e) {
+    throw new Error("RPC timed out — server may be waking up, try again in 10 seconds");
+  } finally {
+    clearTimeout(rpcTimeout);
+  }
   if (!txRes.ok) throw new Error(`RPC failed (${txRes.status}) — is the proxy running?`);
   const txData = await txRes.json();
   const sigs = Array.isArray(txData.result) ? txData.result.map(s => s.signature) : [];
