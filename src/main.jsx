@@ -8,5 +8,3 @@ createRoot(document.getElementById('root')).render(
     <App />
   </StrictMode>,
 )
-const pumpradar = require('./pumpradar-proxy');
-app.use('/api/pumpradar', pumpradar);
