@@ -124,8 +124,27 @@ function opportunityScore(token) {
 
 // ─── FILTER FUNCTIONS ─────────────────────────────────────────────────────────
 const PUMP_SUPPLY = 1_000_000_000;
+
+// Pump.fun bonding curve: estimate price from SOL volume and token volume
+// Real virtual reserves: 30 SOL initial, 1.073B tokens initial
+const PUMP_VIRTUAL_SOL   = 30;
+const PUMP_VIRTUAL_TOKENS = 1_073_000_000;
+const SOL_PRICE_USD = 150; // approximate
+
+function estimatePriceFromVolume(totalVolume, totalSolVolume) {
+  if (!totalVolume || totalVolume <= 0) return null;
+  // Use virtual AMM formula: price = (virtual_sol + sol_in) / (virtual_tokens - tokens_out)
+  const solIn     = totalSolVolume || 0;
+  const tokensOut = totalVolume;
+  const price = ((PUMP_VIRTUAL_SOL + solIn) * SOL_PRICE_USD) /
+                ((PUMP_VIRTUAL_TOKENS - tokensOut) * SOL_PRICE_USD / SOL_PRICE_USD);
+  return price > 0 ? price : null;
+}
+
 function getMcap(token) {
-  return token.jupPrice != null ? token.jupPrice * PUMP_SUPPLY : null;
+  // Prefer Jupiter price, fall back to bonding curve estimate
+  const price = token.jupPrice ?? token.estimatedPrice ?? null;
+  return price != null ? price * PUMP_SUPPLY : null;
 }
 
 function passesClean(token) {
@@ -144,7 +163,7 @@ function passesClean(token) {
 
 function passesGems(token) {
   const mcap = getMcap(token);
-  if (mcap == null)                                               return false; // must have price
+  if (mcap == null)                                               return false;
   if (mcap < GEMS_FILTERS.MIN_MCAP_USD)                          return false;
   if (mcap > GEMS_FILTERS.MAX_MCAP_USD)                          return false;
   if (token.ageMinutes       >  GEMS_FILTERS.MAX_AGE_MINUTES)    return false;
@@ -244,22 +263,26 @@ async function fetchLiveTokens() {
         tokenMap[mint] = {
           mint, buyerSet: new Set(), txSlots: [],
           txCount: 0, firstSeen: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
-          totalVolume: 0, bundleVolumeSol: 0, jitoDetected: false, jitoTxCount: 0,
+          totalVolume: 0, totalSolVolume: 0, bundleVolumeSol: 0,
+          jitoDetected: false, jitoTxCount: 0,
           jitoSigsSeen: new Set(),
           slotSigsSeen: new Set(),
-          bundleVolSigsSeen: new Set(), // dedupe bundle volume per tx
+          bundleVolSigsSeen: new Set(),
           rawTxs: [],
         };
       }
       const buyer = swap.toUserAccount;
       if (buyer && buyer !== "unknown") tokenMap[mint].buyerSet.add(buyer);
-      // Push slot once per tx, not per swap (deduped by signature)
       if (tx.slot && !tokenMap[mint].slotSigsSeen.has(tx.signature)) {
         tokenMap[mint].slotSigsSeen.add(tx.signature);
         tokenMap[mint].txSlots.push(tx.slot);
       }
       tokenMap[mint].txCount++;
       tokenMap[mint].totalVolume += swap.tokenAmount || 0;
+      // Track SOL spent (native transfers to non-Jito accounts = buys)
+      tokenMap[mint].totalSolVolume += nativeTransfers
+        .filter(t => !JITO_TIP_ACCOUNTS.has(t.toUserAccount))
+        .reduce((s, t) => s + (t.amount || 0), 0) / 1e9;
       if (isJito) {
         tokenMap[mint].jitoDetected = true;
         // Only add bundle volume once per tx to avoid multiplying by swap count
@@ -330,10 +353,11 @@ async function fetchLiveTokens() {
     const ageMinutes   = Math.max(1, Math.floor((Date.now() - token.firstSeen) / 60000));
     const slotCluster  = computeSlotClusterScore(token.txSlots);
     const bundleScore  = computeBundleScore(token.txCount, uniqueBuyers.length, slotCluster);
-    const jupPrice     = prices[mint]?.price ?? null;
+    const jupPrice      = prices[mint]?.price ?? null;
+    const estimatedPrice = jupPrice ?? estimatePriceFromVolume(token.totalVolume, token.totalSolVolume);
     // Record price for future scans and compute real % change
-    recordPrice(mint, jupPrice);
-    const realChange   = getRealPriceChange(mint, jupPrice);
+    recordPrice(mint, jupPrice ?? estimatedPrice);
+    const realChange   = getRealPriceChange(mint, jupPrice ?? estimatedPrice);
     const priceChange  = realChange != null ? realChange : 0;
 
     // Sort timestamped txs for early buyer detection; exclude null-timestamp txs
@@ -369,7 +393,7 @@ async function fetchLiveTokens() {
       insiderCount:     Math.min(insiderSet.size, 8),
       bundleScore:      +bundleScore.toFixed(3),
       slotClusterScore: +slotCluster.toFixed(3),
-      topHolderConc:    0.30, // conservative fixed estimate — real data needs on-chain holder fetch
+      topHolderConc:    0.30,
       ageMinutes,
       firstSeen:        token.firstSeen,
       jitoDetected:     token.jitoDetected,
@@ -378,6 +402,7 @@ async function fetchLiveTokens() {
       priceChange,
       hasPriceHistory:  realChange !== null,
       jupPrice,
+      estimatedPrice,
       volume:           token.totalVolume,
       txCount:          token.txCount,
       suspiciousWallets,
@@ -386,9 +411,10 @@ async function fetchLiveTokens() {
 }
 
 // ─── MARKETCAP HELPER ────────────────────────────────────────────────────────
-function fmtMcap(jupPrice) {
-  if (jupPrice == null) return null;
-  const mcap = jupPrice * PUMP_SUPPLY;
+function fmtMcap(token) {
+  const price = token?.jupPrice ?? token?.estimatedPrice ?? null;
+  if (price == null) return null;
+  const mcap = price * PUMP_SUPPLY;
   if (mcap >= 1_000_000) return `$${(mcap / 1_000_000).toFixed(1)}M`;
   if (mcap >= 1_000)     return `$${(mcap / 1_000).toFixed(1)}K`;
   return `$${mcap.toFixed(0)}`;
@@ -397,7 +423,7 @@ function fmtMcap(jupPrice) {
 // ─── AI SIGNAL ────────────────────────────────────────────────────────────────
 async function getAISignal(token, mode) {
   const isClean = mode === "clean";
-  const mcap = token.jupPrice ? fmtMcap(token.jupPrice) : "unknown";
+  const mcap = fmtMcap(token) || "unknown";
   const prompt = isClean
     ? `You are an aggressive pump.fun trader. Give a decisive signal — do NOT default to WATCH unless truly uncertain.
 
@@ -639,8 +665,8 @@ function CleanCard({ token, rank, lm = false }) {
           {token.jupPrice != null && (
             <div style={{ color:"#5bc0ff", fontSize:9, marginTop:1 }}>{fmtJup(token.jupPrice)}</div>
           )}
-          {fmtMcap(token.jupPrice) && (
-            <div style={{ color:"#ffaa00", fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token.jupPrice)}</div>
+          {fmtMcap(token) && (
+            <div style={{ color:"#ffaa00", fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token)}</div>
           )}
         </div>
       </div>
@@ -726,7 +752,7 @@ function GemCard({ token, rank, lm = false }) {
           <div style={{ color:ac, fontWeight:900, fontSize:14, fontFamily:"'Space Mono',monospace" }}>+{token.priceChange.toFixed(1)}%</div>
           <div style={{ color:textMuted, fontSize:9, marginTop:1 }}>{token.ageMinutes}m old</div>
           {token.jupPrice != null && <div style={{ color:"#5bc0ff", fontSize:9, marginTop:1 }}>{fmtJup(token.jupPrice)}</div>}
-          {fmtMcap(token.jupPrice) && <div style={{ color:ac, fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token.jupPrice)}</div>}
+          {fmtMcap(token) && <div style={{ color:ac, fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token)}</div>}
         </div>
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:5, marginTop:10 }}>
@@ -809,8 +835,8 @@ function FrontrunCard({ token, rank, lm = false }) {
         <div style={{ textAlign:"right", flexShrink:0 }}>
           <div style={{ color:"#ffaa00", fontWeight:900, fontSize:13, fontFamily:"'Space Mono',monospace" }}>+{token.priceChange.toFixed(1)}%</div>
           <div style={{ color:textMuted, fontSize:9, marginTop:1 }}>{token.ageMinutes}m old</div>
-          {fmtMcap(token.jupPrice) && (
-            <div style={{ color:"#ffaa00", fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token.jupPrice)}</div>
+          {fmtMcap(token) && (
+            <div style={{ color:"#ffaa00", fontSize:9, marginTop:1, fontWeight:900 }}>MC {fmtMcap(token)}</div>
           )}
         </div>
       </div>
@@ -961,7 +987,7 @@ export default function App() {
       for (const t of gemsList) {
         if (!everSeenRef.current.gems.has(t.mint)) {
           everSeenRef.current.gems.add(t.mint);
-          addToast(`${t.symbol} gem found · MC ${fmtMcap(t.jupPrice) || "?"}`, "gems");
+          addToast(`${t.symbol} gem found · MC ${fmtMcap(t) || "?"}`, "gems");
         }
       }
       for (const t of frontrunList) {
