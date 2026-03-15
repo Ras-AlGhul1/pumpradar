@@ -504,7 +504,7 @@ async function handleCommand(chatId, text) {
 
     case '/autoon':
       startAutoScan(chatId);
-      await sendMessage(chatId, '✅ Auto\\-scan started\\. You\\'ll be notified instantly when signals appear\\.');
+      await sendMessage(chatId, '✅ Auto-scan started. You will be notified instantly when signals appear.');
       break;
 
     case '/autooff':
