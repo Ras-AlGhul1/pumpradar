@@ -1,11 +1,4 @@
 import fetch from 'node-fetch';
-import http from 'http';
-
-// Dummy HTTP server to satisfy Render's port requirement
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => res.end('PumpRadar bot is running')).listen(PORT, () => {
-  console.log(`Health check server on port ${PORT}`);
-});
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
